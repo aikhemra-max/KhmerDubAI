@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import re
@@ -9,1590 +8,1474 @@ import shutil
 import subprocess
 import tempfile
 import time
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Awaitable, Callable, Optional
 
 import edge_tts
 from faster_whisper import WhisperModel
 from google import genai
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-    Update,
-)
-from telegram.constants import ChatAction
-from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
+from telegram import Message, ReplyKeyboardMarkup, Update
+from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
 
-
-# =============================================================================
-# Configuration
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Logging and configuration
+# ---------------------------------------------------------------------------
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
 )
-logger = logging.getLogger("khmerdubai.v10")
+logger = logging.getLogger("khmerdubai")
 
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
-WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
-WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+def env_int(name: str, default: int, minimum: int = 0) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, got {raw!r}") from exc
+    if value < minimum:
+        raise RuntimeError(f"{name} must be >= {minimum}, got {value}")
+    return value
 
-MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "100"))
-MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
-MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "1")))
-TELEGRAM_SEND_LIMIT_MB = int(os.getenv("TELEGRAM_SEND_LIMIT_MB", "49"))
-TELEGRAM_SEND_LIMIT_BYTES = TELEGRAM_SEND_LIMIT_MB * 1024 * 1024
 
-TTS_CONCURRENCY = max(1, int(os.getenv("TTS_CONCURRENCY", "2")))
-TTS_RETRIES = max(1, int(os.getenv("TTS_RETRIES", "3")))
-GEMINI_RETRIES = max(1, int(os.getenv("GEMINI_RETRIES", "4")))
+def env_float(name: str, default: float, minimum: float | None = None) -> float:
+    raw = os.getenv(name, str(default))
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a number, got {raw!r}") from exc
+    if minimum is not None and value < minimum:
+        raise RuntimeError(f"{name} must be >= {minimum}, got {value}")
+    return value
 
-AUDIO_SAMPLE_RATE = int(os.getenv("AUDIO_SAMPLE_RATE", "24000"))
-AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")
-MIX_ORIGINAL_VOLUME = float(os.getenv("MIX_ORIGINAL_VOLUME", "0.18"))
 
-ALLOWED_EXTENSIONS = {
-    ".mp4", ".mkv", ".mov", ".avi",
-    ".mp3", ".wav", ".m4a", ".ogg", ".oga", ".webm",
-}
-VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
-AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".ogg", ".oga"}
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, str(default)).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be true/false, got {raw!r}")
 
-VALID_TAGS = {
-    "M", "F", "BOY", "GIRL", "OLD_M", "OLD_F",
-    "M_THINK", "F_THINK", "BOY_THINK", "GIRL_THINK",
-    "OLD_M_THINK", "OLD_F_THINK", "NARRATOR", "SYSTEM",
-    "CROWD", "UNKNOWN",
-}
 
-TAG_PATTERN = re.compile(
-    r"^\[(M|F|BOY|GIRL|OLD_M|OLD_F|M_THINK|F_THINK|"
-    r"BOY_THINK|GIRL_THINK|OLD_M_THINK|OLD_F_THINK|"
-    r"NARRATOR|SYSTEM|CROWD|UNKNOWN)\]\s*",
-    re.IGNORECASE,
-)
-CJK_PATTERN = re.compile(r"[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]")
-CONTROL_PATTERN = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
-MULTISPACE_PATTERN = re.compile(r"[ \t]+")
-REPEATED_PUNCT_PATTERN = re.compile(r"([!?។៕,，。！？])\1{1,}")
-SRT_TIME_PATTERN = re.compile(
-    r"^\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->\s*"
-    r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*$"
-)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-# Edge-TTS currently exposes two Khmer base voices. Child/elderly/thought
-# profiles use gentle rate/volume changes only; pitch stays neutral to reduce
-# unstable, robotic sound.
-VOICE_PROFILES: dict[str, dict[str, str]] = {
-    "M":            {"voice": "km-KH-PisethNeural", "rate": "-5%",  "pitch": "+0Hz", "volume": "+0%"},
-    "F":            {"voice": "km-KH-SreymomNeural", "rate": "-5%", "pitch": "+0Hz", "volume": "+0%"},
-    "BOY":          {"voice": "km-KH-PisethNeural", "rate": "+2%",  "pitch": "+0Hz", "volume": "+0%"},
-    "GIRL":         {"voice": "km-KH-SreymomNeural", "rate": "+2%", "pitch": "+0Hz", "volume": "+0%"},
-    "OLD_M":        {"voice": "km-KH-PisethNeural", "rate": "-12%", "pitch": "+0Hz", "volume": "+0%"},
-    "OLD_F":        {"voice": "km-KH-SreymomNeural", "rate": "-12%","pitch": "+0Hz", "volume": "+0%"},
-    "M_THINK":      {"voice": "km-KH-PisethNeural", "rate": "-9%",  "pitch": "+0Hz", "volume": "-5%"},
-    "F_THINK":      {"voice": "km-KH-SreymomNeural", "rate": "-9%", "pitch": "+0Hz", "volume": "-5%"},
-    "BOY_THINK":    {"voice": "km-KH-PisethNeural", "rate": "-3%",  "pitch": "+0Hz", "volume": "-5%"},
-    "GIRL_THINK":   {"voice": "km-KH-SreymomNeural", "rate": "-3%", "pitch": "+0Hz", "volume": "-5%"},
-    "OLD_M_THINK":  {"voice": "km-KH-PisethNeural", "rate": "-15%", "pitch": "+0Hz", "volume": "-6%"},
-    "OLD_F_THINK":  {"voice": "km-KH-SreymomNeural", "rate": "-15%","pitch": "+0Hz", "volume": "-6%"},
-    "NARRATOR":     {"voice": "km-KH-PisethNeural", "rate": "-8%",  "pitch": "+0Hz", "volume": "+0%"},
-    "SYSTEM":       {"voice": "km-KH-SreymomNeural", "rate": "-4%", "pitch": "+0Hz", "volume": "+0%"},
-    "CROWD":        {"voice": "km-KH-PisethNeural", "rate": "-2%",  "pitch": "+0Hz", "volume": "-2%"},
-    "UNKNOWN":      {"voice": "km-KH-PisethNeural", "rate": "-5%",  "pitch": "+0Hz", "volume": "+0%"},
-}
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base").strip()
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu").strip()
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8").strip()
 
-PROGRESS_TEXT = {
-    "download": "⬇️ 1/12 កំពុងទាញយកឯកសារ…",
-    "extract": "🎵 2/12 កំពុងទាញសំឡេង និងកែសម្រួល…",
-    "transcribe": "📝 3/12 កំពុងស្គាល់សំឡេងភាសាចិន…",
-    "translate": "🌐 4/12 កំពុងបកប្រែជាភាសាខ្មែរ…",
-    "speaker": "👥 5/12 កំពុងកំណត់ប្រភេទតួអង្គ…",
-    "srt": "📄 6/12 កំពុងរៀបចំឯកសារ SRT…",
-    "review": "✍️ 7/12 សូមពិនិត្យ ឬកែ SRT មុនបង្កើតសំឡេង។",
-    "tts": "🎙️ 8/12 កំពុងបង្កើតសំឡេងខ្មែរ…",
-    "combine": "🎧 9/12 កំពុងរៀបចំ MP3 ជាប់តាមពេលវេលា…",
-    "mp4": "🎬 10/12 កំពុងបង្កើតវីដេអូ MP4…",
-    "send": "📤 11/12 កំពុងផ្ញើឯកសារ…",
-    "clean": "🧹 12/12 កំពុងសម្អាតឯកសារបណ្ដោះអាសន្ន…",
-}
+MAX_FILE_MB = env_int("MAX_FILE_MB", 45, 1)
+MAX_MEDIA_SECONDS = env_int("MAX_MEDIA_SECONDS", 300, 1)
+SESSION_IDLE_SECONDS = env_int("SESSION_IDLE_SECONDS", 600, 30)
+AUTO_DELETE_MINUTES = env_int("AUTO_DELETE_MINUTES", 5, 0)
 
-REVIEW_KEYBOARD = InlineKeyboardMarkup(
-    [
-        [
-            InlineKeyboardButton("🎧 Generate MP3", callback_data="v10:mp3"),
-            InlineKeyboardButton("🎬 Generate MP4", callback_data="v10:mp4"),
-        ],
-        [
-            InlineKeyboardButton("📄 Upload Edited SRT", callback_data="v10:upload_srt"),
-            InlineKeyboardButton("❌ Cancel Project", callback_data="v10:cancel"),
-        ],
-    ]
+DELETE_USER_UPLOAD = env_bool("DELETE_USER_UPLOAD", True)
+DELETE_OUTPUT_MESSAGES = env_bool("DELETE_OUTPUT_MESSAGES", True)
+
+MAX_TTS_RETRIES = env_int("MAX_TTS_RETRIES", 3, 1)
+TRANSLATION_RETRIES = env_int("TRANSLATION_RETRIES", 3, 1)
+TTS_TIMEOUT_SECONDS = env_int("TTS_TIMEOUT_SECONDS", 90, 5)
+GEMINI_TIMEOUT_SECONDS = env_int("GEMINI_TIMEOUT_SECONDS", 180, 10)
+SUBPROCESS_TIMEOUT_SECONDS = env_int("SUBPROCESS_TIMEOUT_SECONDS", 300, 10)
+TTS_CONCURRENCY = env_int("TTS_CONCURRENCY", 4, 1)
+UPDATE_CONCURRENCY = env_int("UPDATE_CONCURRENCY", 8, 1)
+
+MIN_SPEED = env_float("MIN_SPEED", 0.88, 0.5)
+MAX_SPEED = env_float("MAX_SPEED", 1.15, 0.5)
+if MIN_SPEED > MAX_SPEED:
+    raise RuntimeError("MIN_SPEED cannot be greater than MAX_SPEED")
+
+MALE_VOICE = os.getenv("MALE_VOICE", "km-KH-PisethNeural").strip()
+FEMALE_VOICE = os.getenv("FEMALE_VOICE", "km-KH-SreymomNeural").strip()
+
+NEW_PROJECT_BUTTON = "🆕 ធ្វើថ្មី"
+PROJECT_KEYBOARD = ReplyKeyboardMarkup(
+    [[NEW_PROJECT_BUTTON]],
+    resize_keyboard=True,
+    is_persistent=True,
 )
 
-AUDIO_MODE_KEYBOARD = InlineKeyboardMarkup(
-    [
-        [InlineKeyboardButton("🔇 Replace Original Audio", callback_data="v10:mp4:replace")],
-        [InlineKeyboardButton("🎚 Mix With Original Audio", callback_data="v10:mp4:mix")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="v10:back")],
-    ]
-)
+SUPPORTED_DOCUMENT_SUFFIXES = {
+    ".srt",
+    ".mp3",
+    ".wav",
+    ".m4a",
+    ".ogg",
+    ".oga",
+    ".opus",
+    ".aac",
+    ".flac",
+    ".mp4",
+    ".mov",
+    ".mkv",
+    ".avi",
+    ".webm",
+}
+VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
+
+ProgressCallback = Callable[[int, str], Awaitable[None]]
 
 
-# =============================================================================
-# Data models
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Data models and state
+# ---------------------------------------------------------------------------
 
 @dataclass(slots=True)
-class Subtitle:
+class SubtitleCue:
     index: int
-    start_ms: int
-    end_ms: int
-    text: str
-    tag: str = "M"
-
-    @property
-    def duration_ms(self) -> int:
-        return max(1, self.end_ms - self.start_ms)
-
-
-@dataclass(slots=True)
-class Project:
-    user_id: int
-    chat_id: int
-    project_id: str
-    root: Path
-    source_path: Optional[Path] = None
-    normalized_wav: Optional[Path] = None
-    chinese_srt: Optional[Path] = None
-    khmer_srt: Optional[Path] = None
-    dubbed_mp3: Optional[Path] = None
-    dubbed_mp4: Optional[Path] = None
-    progress_message_id: Optional[int] = None
-    waiting_for_srt: bool = False
-    processing: bool = False
-    cancelled: bool = False
-    created_at: float = field(default_factory=time.time)
-
-    def cleanup(self) -> None:
-        shutil.rmtree(self.root, ignore_errors=True)
-
-
-@dataclass(slots=True)
-class TTSGroup:
+    start: float
+    end: float
     tag: str
-    start_ms: int
-    end_ms: int
+    emotion: str
     text: str
-    members: list[Subtitle]
 
 
-# =============================================================================
-# Global services
-# =============================================================================
+@dataclass
+class ChatSession:
+    active: bool = False
+    generation: int = 0
+    last_activity: float = 0.0
+    message_ids: set[int] = field(default_factory=set)
+    expiry_task: asyncio.Task | None = None
+    processing_task: asyncio.Task | None = None
+    state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
-USER_LOCKS: dict[int, asyncio.Lock] = {}
-PROJECTS: dict[int, Project] = {}
 
-_gemini_client: Optional[genai.Client] = None
-_whisper_model: Optional[WhisperModel] = None
+sessions: dict[int, ChatSession] = {}
+
+_whisper_model: WhisperModel | None = None
 _whisper_lock = asyncio.Lock()
+gemini_client: genai.Client | None = None
 
 
-def get_gemini_client() -> genai.Client:
-    global _gemini_client
-    if _gemini_client is None:
-        _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    return _gemini_client
+VOICE_PROFILES = {
+    "M_YOUNG": {"voice": MALE_VOICE, "rate": "+6%", "pitch": "+4Hz", "volume": "+0%"},
+    "F_YOUNG": {"voice": FEMALE_VOICE, "rate": "+5%", "pitch": "+5Hz", "volume": "+0%"},
+    "M_ADULT": {"voice": MALE_VOICE, "rate": "+0%", "pitch": "+0Hz", "volume": "+0%"},
+    "F_ADULT": {"voice": FEMALE_VOICE, "rate": "+0%", "pitch": "+0Hz", "volume": "+0%"},
+    "M_OLD": {"voice": MALE_VOICE, "rate": "-10%", "pitch": "-16Hz", "volume": "+2%"},
+    "F_OLD": {"voice": FEMALE_VOICE, "rate": "-10%", "pitch": "-14Hz", "volume": "+2%"},
+    "BOY": {"voice": MALE_VOICE, "rate": "+10%", "pitch": "+18Hz", "volume": "+0%"},
+    "GIRL": {"voice": FEMALE_VOICE, "rate": "+10%", "pitch": "+18Hz", "volume": "+0%"},
+    "M_THINK": {"voice": MALE_VOICE, "rate": "-6%", "pitch": "-3Hz", "volume": "-5%"},
+    "F_THINK": {"voice": FEMALE_VOICE, "rate": "-6%", "pitch": "-3Hz", "volume": "-5%"},
+    "NARRATOR_M": {"voice": MALE_VOICE, "rate": "-3%", "pitch": "-2Hz", "volume": "+0%"},
+    "NARRATOR_F": {"voice": FEMALE_VOICE, "rate": "-3%", "pitch": "-2Hz", "volume": "+0%"},
+}
+VALID_TAGS = set(VOICE_PROFILES)
+
+EMOTION_ADJUSTMENTS = {
+    "NEUTRAL": {"rate": 0, "pitch": 0, "volume": 0},
+    "HAPPY": {"rate": 5, "pitch": 3, "volume": 1},
+    "SAD": {"rate": -8, "pitch": -3, "volume": -2},
+    "ANGRY": {"rate": 7, "pitch": 3, "volume": 3},
+    "FEAR": {"rate": 5, "pitch": 4, "volume": 0},
+    "LOVE": {"rate": -5, "pitch": 1, "volume": -1},
+    "SARCASM": {"rate": -1, "pitch": 2, "volume": 0},
+    "CRYING": {"rate": -9, "pitch": -2, "volume": -3},
+    "THINKING": {"rate": -6, "pitch": -3, "volume": -5},
+}
+VALID_EMOTIONS = set(EMOTION_ADJUSTMENTS)
 
 
-async def get_whisper_model() -> WhisperModel:
-    global _whisper_model
-    if _whisper_model is None:
-        async with _whisper_lock:
-            if _whisper_model is None:
-                logger.info(
-                    "Loading Faster-Whisper model=%s device=%s compute_type=%s",
-                    WHISPER_MODEL,
-                    WHISPER_DEVICE,
-                    WHISPER_COMPUTE_TYPE,
-                )
-                _whisper_model = await asyncio.to_thread(
-                    WhisperModel,
-                    WHISPER_MODEL,
-                    device=WHISPER_DEVICE,
-                    compute_type=WHISPER_COMPUTE_TYPE,
-                )
-    return _whisper_model
+# ---------------------------------------------------------------------------
+# Startup checks
+# ---------------------------------------------------------------------------
 
-
-# =============================================================================
-# Utility helpers
-# =============================================================================
-
-def sanitize_filename(name: str) -> str:
-    name = Path(name or "upload.bin").name
-    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
-    return stem[:120] or "upload.bin"
-
-
-def command_exists(name: str) -> bool:
-    return shutil.which(name) is not None
-
-
-def require_system_tools() -> None:
-    missing = [tool for tool in ("ffmpeg", "ffprobe") if not command_exists(tool)]
+def validate_runtime() -> None:
+    missing = []
+    if not TELEGRAM_BOT_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not GEMINI_API_KEY:
+        missing.append("GEMINI_API_KEY")
     if missing:
         raise RuntimeError(
-            "Missing system tools: "
-            + ", ".join(missing)
-            + ". Install FFmpeg before running KhmerDubAI."
+            "Missing required environment variables: " + ", ".join(missing)
         )
 
-
-async def run_command(
-    args: list[str],
-    *,
-    timeout: int = 3600,
-    cwd: Optional[Path] = None,
-) -> tuple[str, str]:
-    logger.debug("Running command: %s", " ".join(args))
-    process = await asyncio.create_subprocess_exec(
-        *args,
-        cwd=str(cwd) if cwd else None,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout_b, stderr_b = await asyncio.wait_for(process.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        process.kill()
-        await process.communicate()
-        raise RuntimeError(f"Command timed out after {timeout}s: {args[0]}") from None
-
-    stdout = stdout_b.decode("utf-8", errors="replace")
-    stderr = stderr_b.decode("utf-8", errors="replace")
-    if process.returncode != 0:
-        logger.error("Command failed (%s): %s", process.returncode, stderr[-4000:])
-        raise RuntimeError(f"{args[0]} failed: {stderr[-1200:]}")
-    return stdout, stderr
-
-
-async def update_progress(
-    context: ContextTypes.DEFAULT_TYPE,
-    project: Project,
-    text: str,
-) -> None:
-    if project.cancelled:
-        raise asyncio.CancelledError("Project cancelled by user")
-
-    try:
-        if project.progress_message_id:
-            await context.bot.edit_message_text(
-                chat_id=project.chat_id,
-                message_id=project.progress_message_id,
-                text=text,
+    for program in ("ffmpeg", "ffprobe"):
+        if shutil.which(program) is None:
+            raise RuntimeError(
+                f"{program} was not found. Install FFmpeg and ensure "
+                f"{program} is available in PATH."
             )
-        else:
-            msg = await context.bot.send_message(project.chat_id, text)
-            project.progress_message_id = msg.message_id
-    except TelegramError as exc:
-        # "Message is not modified" and temporary edit failures should not abort a job.
-        logger.warning("Progress update failed: %s", exc)
 
 
-def ms_to_srt(ms: int) -> str:
-    ms = max(0, int(ms))
-    hours, rem = divmod(ms, 3_600_000)
-    minutes, rem = divmod(rem, 60_000)
-    seconds, millis = divmod(rem, 1_000)
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+def initialize_clients() -> None:
+    global gemini_client
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
-def parse_srt_time(value: str) -> tuple[int, int]:
-    match = SRT_TIME_PATTERN.match(value)
+# ---------------------------------------------------------------------------
+# Session and Telegram helpers
+# ---------------------------------------------------------------------------
+
+def get_session(chat_id: int) -> ChatSession:
+    return sessions.setdefault(chat_id, ChatSession())
+
+
+def track_message(message: Message | None) -> None:
+    if message is not None:
+        get_session(message.chat_id).message_ids.add(message.message_id)
+
+
+async def safe_delete_message(bot, chat_id: int, message_id: int) -> None:
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except (BadRequest, Forbidden):
+        pass
+    except (NetworkError, TimedOut) as exc:
+        logger.debug("Temporary delete failure: %s", exc)
+    except Exception:
+        logger.debug("Unexpected delete failure", exc_info=True)
+
+
+async def delete_message_later(message: Message | None, seconds: int) -> None:
+    if message is None or seconds <= 0:
+        return
+    try:
+        await asyncio.sleep(seconds)
+        await message.delete()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.debug("Auto-delete ignored for %s: %s", message.message_id, exc)
+
+
+def schedule_delete(message: Message | None, enabled: bool = True) -> None:
+    if not enabled or message is None or AUTO_DELETE_MINUTES <= 0:
+        return
+    asyncio.create_task(
+        delete_message_later(message, AUTO_DELETE_MINUTES * 60),
+        name=f"delete-message-{message.chat_id}-{message.message_id}",
+    )
+
+
+async def clear_previous_project(
+    bot,
+    chat_id: int,
+    keep_message_id: int | None = None,
+) -> None:
+    session = get_session(chat_id)
+    old_ids = tuple(session.message_ids)
+    session.message_ids.clear()
+
+    await asyncio.gather(
+        *(
+            safe_delete_message(bot, chat_id, message_id)
+            for message_id in old_ids
+            if message_id != keep_message_id
+        ),
+        return_exceptions=True,
+    )
+
+
+async def expire_after_inactivity(
+    bot,
+    chat_id: int,
+    generation: int,
+) -> None:
+    try:
+        while True:
+            session = get_session(chat_id)
+            if session.generation != generation or not session.active:
+                return
+
+            remaining = SESSION_IDLE_SECONDS - (
+                time.monotonic() - session.last_activity
+            )
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+                continue
+
+            if session.processing_task and not session.processing_task.done():
+                session.last_activity = time.monotonic()
+                await asyncio.sleep(min(60, SESSION_IDLE_SECONDS))
+                continue
+
+            session.active = False
+            notice = await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "⌛ គម្រោងផុតកំណត់ ព្រោះគ្មានសកម្មភាព។\n\n"
+                    "ចុច «🆕 ធ្វើថ្មី» មុនពេលផ្ញើឯកសារថ្មី។"
+                ),
+                reply_markup=PROJECT_KEYBOARD,
+            )
+            track_message(notice)
+            return
+    except asyncio.CancelledError:
+        return
+
+
+def touch_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    session = get_session(chat_id)
+    session.last_activity = time.monotonic()
+
+    old_task = session.expiry_task
+    if old_task and not old_task.done():
+        old_task.cancel()
+
+    session.expiry_task = asyncio.create_task(
+        expire_after_inactivity(
+            context.bot,
+            chat_id,
+            session.generation,
+        ),
+        name=f"session-expiry-{chat_id}-{session.generation}",
+    )
+
+
+async def require_project(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    if update.effective_chat is None or update.effective_message is None:
+        return False
+
+    chat_id = update.effective_chat.id
+    session = get_session(chat_id)
+
+    if not session.active:
+        prompt = await update.effective_message.reply_text(
+            "សូមចុច «🆕 ធ្វើថ្មី» ជាមុនសិន "
+            "ទើបអាចផ្ញើវីដេអូ សំឡេង ឬ SRT បាន។",
+            reply_markup=PROJECT_KEYBOARD,
+        )
+        track_message(prompt)
+        return False
+
+    current = session.processing_task
+    if current and not current.done() and current is not asyncio.current_task():
+        prompt = await update.effective_message.reply_text(
+            "⏳ កំពុងដំណើរការឯកសារមួយរួចហើយ។\n"
+            "សូមរង់ចាំឱ្យចប់ ឬចុច «🆕 ធ្វើថ្មី» ដើម្បីបញ្ឈប់ការងារចាស់។",
+            reply_markup=PROJECT_KEYBOARD,
+        )
+        track_message(prompt)
+        schedule_delete(prompt)
+        return False
+
+    track_message(update.effective_message)
+    touch_session(context, chat_id)
+    return True
+
+
+async def set_processing_task(chat_id: int) -> bool:
+    session = get_session(chat_id)
+    async with session.state_lock:
+        current = session.processing_task
+        if current and not current.done() and current is not asyncio.current_task():
+            return False
+        session.processing_task = asyncio.current_task()
+        return True
+
+
+async def clear_processing_task(chat_id: int) -> None:
+    session = get_session(chat_id)
+    async with session.state_lock:
+        if session.processing_task is asyncio.current_task():
+            session.processing_task = None
+
+
+# ---------------------------------------------------------------------------
+# SRT helpers
+# ---------------------------------------------------------------------------
+
+def srt_time(seconds: float) -> str:
+    milliseconds = max(0, round(seconds * 1000))
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, millis = divmod(remainder, 1000)
+    return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
+
+
+def time_to_seconds(value: str) -> float:
+    match = re.fullmatch(
+        r"(\d{1,3}):(\d{2}):(\d{2})[,.](\d{3})",
+        value.strip(),
+    )
     if not match:
         raise ValueError(f"Invalid SRT timestamp: {value!r}")
 
-    parts = [int(item) for item in match.groups()]
-    sh, sm, ss, sms, eh, em, es, ems = parts
-    start = ((sh * 60 + sm) * 60 + ss) * 1000 + min(sms, 999)
-    end = ((eh * 60 + em) * 60 + es) * 1000 + min(ems, 999)
-    if end <= start:
-        end = start + 300
-    return start, end
+    hours, minutes, seconds, milliseconds = map(int, match.groups())
+    if minutes >= 60 or seconds >= 60:
+        raise ValueError(f"Invalid SRT timestamp: {value!r}")
+    return hours * 3600 + minutes * 60 + seconds + milliseconds / 1000
 
 
-def clean_text(text: str) -> str:
-    text = CONTROL_PATTERN.sub("", text or "")
-    text = text.replace("\ufeff", "").replace("\u200b", "")
-    text = MULTISPACE_PATTERN.sub(" ", text)
+def normalize_srt(text: str) -> str:
+    return text.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def split_srt_blocks(text: str) -> list[str]:
+    normalized = normalize_srt(text)
+    return [block.strip() for block in re.split(r"\n\s*\n", normalized) if block.strip()]
+
+
+def srt_signature(text: str) -> list[tuple[int, str]]:
+    signature: list[tuple[int, str]] = []
+    for block in split_srt_blocks(text):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if len(lines) < 3:
+            raise ValueError("Invalid SRT block: expected index, timestamp and text")
+        try:
+            index = int(lines[0])
+        except ValueError as exc:
+            raise ValueError(f"Invalid SRT index: {lines[0]!r}") from exc
+
+        timestamp = re.sub(r"\s+", " ", lines[1]).replace(".", ",")
+        if not re.fullmatch(
+            r"\d{1,3}:\d{2}:\d{2},\d{3}\s*-->\s*"
+            r"\d{1,3}:\d{2}:\d{2},\d{3}",
+            timestamp,
+        ):
+            raise ValueError(f"Invalid SRT timestamp line: {lines[1]!r}")
+        signature.append((index, timestamp))
+    if not signature:
+        raise ValueError("The SRT file contains no valid subtitle blocks")
+    return signature
+
+
+def clean_gemini_output(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"^```(?:srt|text)?\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```$", "", text)
     return text.strip()
 
 
-def normalize_khmer_tts_text(text: str) -> str:
-    text = TAG_PATTERN.sub("", clean_text(text))
-    text = CJK_PATTERN.sub("", text)
-    replacements = {
-        "，": ", ",
-        "。": "។ ",
-        "！": "! ",
-        "？": "? ",
-        "：": ": ",
-        "；": "; ",
-        "…": "… ",
-        "\n": " ",
-    }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-    text = REPEATED_PUNCT_PATTERN.sub(r"\1", text)
-    text = MULTISPACE_PATTERN.sub(" ", text)
-    return text.strip(" \t\r\n-")
+def contains_chinese(text: str) -> bool:
+    return bool(re.search(r"[\u3400-\u4DBF\u4E00-\u9FFF]", text))
 
 
-def split_tagged_text(text: str) -> tuple[str, str]:
-    text = clean_text(text)
-    match = TAG_PATTERN.match(text)
-    if not match:
-        return "M", text
-    tag = match.group(1).upper()
-    if tag == "UNKNOWN":
-        tag = "M"
-    return tag if tag in VALID_TAGS else "M", text[match.end():].strip()
+def translation_prompt() -> str:
+    return """
+You are KhmerDubAI, a professional Chinese-to-Khmer movie subtitle and
+dubbing translator.
 
+Return ONLY valid SRT.
 
-def subtitles_to_srt(subtitles: Iterable[Subtitle]) -> str:
-    blocks: list[str] = []
-    for number, sub in enumerate(subtitles, start=1):
-        tag = sub.tag if sub.tag in VALID_TAGS and sub.tag != "UNKNOWN" else "M"
-        text = normalize_khmer_tts_text(sub.text)
-        if not text:
-            text = "…"
-        blocks.append(
-            f"{number}\n"
-            f"{ms_to_srt(sub.start_ms)} --> {ms_to_srt(sub.end_ms)}\n"
-            f"[{tag}] {text}"
-        )
-    return "\n\n".join(blocks) + "\n"
+STRICT RULES:
+1. Preserve every subtitle index and timestamp exactly.
+2. Preserve the exact number and order of blocks.
+3. Never merge, split, omit, duplicate, reorder, or invent dialogue.
+4. Remove all Chinese characters from the output.
+5. Translate into natural Cambodian spoken Khmer suitable for dubbing.
+6. Preserve meaning, humor, status, relationships, emotion, and continuity.
+7. Keep lines concise enough for their timestamps.
+8. Each dialogue line must begin with exactly one voice tag and one emotion tag.
 
+VOICE TAGS:
+[M_YOUNG] [F_YOUNG] [M_ADULT] [F_ADULT]
+[M_OLD] [F_OLD] [BOY] [GIRL]
+[M_THINK] [F_THINK] [NARRATOR_M] [NARRATOR_F]
 
-def parse_srt(content: str) -> list[Subtitle]:
-    content = content.replace("\r\n", "\n").replace("\r", "\n").strip()
-    raw_blocks = re.split(r"\n\s*\n", content)
-    result: list[Subtitle] = []
+EMOTION TAGS:
+[NEUTRAL] [HAPPY] [SAD] [ANGRY] [FEAR]
+[LOVE] [SARCASM] [CRYING] [THINKING]
 
-    for raw in raw_blocks:
-        lines = [clean_text(line) for line in raw.splitlines() if clean_text(line)]
-        if len(lines) < 2:
-            continue
+Use the same voice tag for the same nearby speaker. Use adult when age is
+uncertain. Use thinking tags only for inner monologue and narrator tags only
+for narration.
 
-        timestamp_idx = next((i for i, line in enumerate(lines) if "-->" in line), -1)
-        if timestamp_idx < 0:
-            continue
-
-        try:
-            start_ms, end_ms = parse_srt_time(lines[timestamp_idx])
-        except ValueError:
-            continue
-
-        dialogue = " ".join(lines[timestamp_idx + 1:]).strip()
-        if not dialogue:
-            continue
-
-        tag, text = split_tagged_text(dialogue)
-        text = normalize_khmer_tts_text(text)
-        if not text:
-            continue
-
-        result.append(
-            Subtitle(
-                index=len(result) + 1,
-                start_ms=start_ms,
-                end_ms=end_ms,
-                text=text,
-                tag=tag,
-            )
-        )
-
-    if not result:
-        raise ValueError("No valid subtitle blocks were found.")
-
-    result.sort(key=lambda item: (item.start_ms, item.end_ms))
-    for index, item in enumerate(result, start=1):
-        item.index = index
-    return result
-
-
-def safe_json_loads(text: str) -> Any:
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s*```$", "", text)
-    start = text.find("[")
-    end = text.rfind("]")
-    if start < 0 or end < start:
-        raise ValueError("Gemini did not return a JSON array.")
-    return json.loads(text[start:end + 1])
-
-
-def is_video(path: Path) -> bool:
-    return path.suffix.lower() in VIDEO_EXTENSIONS
-
-
-def get_user_lock(user_id: int) -> asyncio.Lock:
-    if user_id not in USER_LOCKS:
-        USER_LOCKS[user_id] = asyncio.Lock()
-    return USER_LOCKS[user_id]
-
-
-def new_project(user_id: int, chat_id: int) -> Project:
-    previous = PROJECTS.pop(user_id, None)
-    if previous:
-        previous.cancelled = True
-        previous.cleanup()
-
-    root = Path(tempfile.mkdtemp(prefix=f"khmerdub_v10_{user_id}_"))
-    project = Project(
-        user_id=user_id,
-        chat_id=chat_id,
-        project_id=uuid.uuid4().hex,
-        root=root,
-    )
-    PROJECTS[user_id] = project
-    return project
-
-
-def get_project(user_id: int) -> Project:
-    project = PROJECTS.get(user_id)
-    if not project:
-        raise RuntimeError("No active project. Upload a video or audio file first.")
-    return project
-
-
-# =============================================================================
-# Media inspection and conversion
-# =============================================================================
-
-async def probe_duration_ms(path: Path) -> int:
-    stdout, _ = await run_command(
-        [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(path),
-        ],
-        timeout=60,
-    )
-    try:
-        return max(1, int(float(stdout.strip()) * 1000))
-    except (TypeError, ValueError):
-        return 1
-
-
-async def has_audio_stream(path: Path) -> bool:
-    stdout, _ = await run_command(
-        [
-            "ffprobe", "-v", "error",
-            "-select_streams", "a:0",
-            "-show_entries", "stream=index",
-            "-of", "csv=p=0",
-            str(path),
-        ],
-        timeout=60,
-    )
-    return bool(stdout.strip())
-
-
-async def extract_normalized_audio(source: Path, output_wav: Path) -> None:
-    if not await has_audio_stream(source):
-        raise RuntimeError("The uploaded file does not contain a readable audio stream.")
-
-    await run_command(
-        [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-i", str(source),
-            "-vn",
-            "-ac", "1",
-            "-ar", "16000",
-            "-c:a", "pcm_s16le",
-            "-af", "highpass=f=70,lowpass=f=7600,dynaudnorm=f=150:g=7",
-            str(output_wav),
-        ],
-        timeout=3600,
-    )
-
-
-# =============================================================================
-# Speech recognition and Gemini translation
-# =============================================================================
-
-def transcribe_sync(model: WhisperModel, audio_path: Path) -> list[Subtitle]:
-    segments, info = model.transcribe(
-        str(audio_path),
-        language="zh",
-        task="transcribe",
-        beam_size=5,
-        vad_filter=True,
-        vad_parameters={
-            "min_silence_duration_ms": 300,
-            "speech_pad_ms": 200,
-        },
-        condition_on_previous_text=True,
-        word_timestamps=False,
-    )
-    logger.info(
-        "Whisper detected language=%s probability=%.3f",
-        getattr(info, "language", "unknown"),
-        float(getattr(info, "language_probability", 0.0)),
-    )
-
-    subtitles: list[Subtitle] = []
-    for segment in segments:
-        text = clean_text(segment.text)
-        if not text:
-            continue
-        start_ms = max(0, round(float(segment.start) * 1000))
-        end_ms = max(start_ms + 250, round(float(segment.end) * 1000))
-        subtitles.append(
-            Subtitle(
-                index=len(subtitles) + 1,
-                start_ms=start_ms,
-                end_ms=end_ms,
-                text=text,
-                tag="M",
-            )
-        )
-
-    if not subtitles:
-        raise RuntimeError("Whisper could not detect any spoken dialogue.")
-    return subtitles
-
-
-async def transcribe_audio(audio_path: Path) -> list[Subtitle]:
-    model = await get_whisper_model()
-    return await asyncio.to_thread(transcribe_sync, model, audio_path)
-
-
-TRANSLATION_SYSTEM_PROMPT = """
-You are the translation and speaker-classification engine for KhmerDubAI V10.
-
-Translate Chinese drama/movie dialogue into fluent, natural SPOKEN Khmer suitable
-for professional dubbing. Never translate mechanically word-for-word.
-
-Speaker tags:
-M, F, BOY, GIRL, OLD_M, OLD_F, M_THINK, F_THINK, BOY_THINK,
-GIRL_THINK, OLD_M_THINK, OLD_F_THINK, NARRATOR, SYSTEM, CROWD, UNKNOWN.
-
-Rules:
-1. Preserve the exact id for every input item.
-2. Return exactly one output item for every input item. Never skip reactions,
-   short lines, names, questions, insults, or emotional words.
-3. Infer age/gender/thought/narration from the nearby dialogue and context.
-4. Keep a character type consistent across connected lines. Do not randomly
-   switch an apparent character between adult, child, elderly, male, and female.
-5. Use M when truly uncertain instead of UNKNOWN.
-6. Khmer must sound natural in daily speech and retain emotion, status,
-   relationship, politeness, threats, comedy, fear, sadness, or affection.
-7. Choose Khmer pronouns according to relationship and rank.
-8. Keep each line concise enough for its displayed duration.
-9. Do not include Chinese characters in the Khmer output.
-10. Do not add explanations, markdown, or code fences.
-
-Return only a valid JSON array:
-[{"id": 1, "tag": "M", "text": "ភាសាខ្មែរ"}, ...]
+Example:
+1
+00:00:01,000 --> 00:00:03,000
+[M_ADULT][ANGRY] ឯងហ៊ានធ្វើបែបនេះមែនទេ!
 """.strip()
 
 
-async def gemini_generate(prompt: str) -> str:
-    client = get_gemini_client()
-    last_error: Optional[Exception] = None
-
-    for attempt in range(1, GEMINI_RETRIES + 1):
-        try:
-            response = await client.aio.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-            )
-            text = getattr(response, "text", None)
-            if not text:
-                raise RuntimeError("Gemini returned an empty response.")
-            return text
-        except Exception as exc:  # SDK may expose several transport exception types.
-            last_error = exc
-            if attempt >= GEMINI_RETRIES:
-                break
-            delay = min(20, 2 ** (attempt - 1))
-            logger.warning(
-                "Gemini attempt %s/%s failed: %s; retrying in %ss",
-                attempt,
-                GEMINI_RETRIES,
-                exc,
-                delay,
-            )
-            await asyncio.sleep(delay)
-
-    raise RuntimeError(f"Gemini translation failed: {last_error}") from last_error
-
-
-def make_translation_batches(subtitles: list[Subtitle], batch_size: int = 35) -> list[list[Subtitle]]:
-    return [subtitles[i:i + batch_size] for i in range(0, len(subtitles), batch_size)]
-
-
-async def translate_batch(
-    batch: list[Subtitle],
-    previous_context: list[Subtitle],
-) -> list[Subtitle]:
-    context_payload = [
-        {"id": item.index, "text": item.text, "tag": item.tag}
-        for item in previous_context[-5:]
-    ]
-    input_payload = [
-        {
-            "id": item.index,
-            "start": ms_to_srt(item.start_ms),
-            "end": ms_to_srt(item.end_ms),
-            "duration_ms": item.duration_ms,
-            "chinese": item.text,
-        }
-        for item in batch
-    ]
-    prompt = (
-        TRANSLATION_SYSTEM_PROMPT
-        + "\n\nPrevious context (do not output these again):\n"
-        + json.dumps(context_payload, ensure_ascii=False)
-        + "\n\nTranslate these items:\n"
-        + json.dumps(input_payload, ensure_ascii=False)
+def retry_delay_from_error(exc: Exception, attempt: int) -> float:
+    text = str(exc)
+    match = re.search(
+        r"(?:retry in|retry after)\s+(\d+(?:\.\d+)?)\s*s",
+        text,
+        flags=re.I,
     )
+    if match:
+        return min(60.0, max(1.0, float(match.group(1)) + 0.5))
+    return min(20.0, 2.0 ** (attempt - 1))
 
-    raw = await gemini_generate(prompt)
-    data = safe_json_loads(raw)
-    if not isinstance(data, list):
-        raise ValueError("Gemini JSON response is not a list.")
 
-    by_id: dict[int, dict[str, Any]] = {}
-    for row in data:
-        if not isinstance(row, dict):
-            continue
+def translate_to_khmer_srt(source_srt: str) -> str:
+    if gemini_client is None:
+        raise RuntimeError("Gemini client is not initialized")
+
+    expected_signature = srt_signature(source_srt)
+    last_error: Exception | None = None
+
+    for attempt in range(1, TRANSLATION_RETRIES + 1):
         try:
-            item_id = int(row.get("id"))
-        except (TypeError, ValueError):
-            continue
-        by_id[item_id] = row
-
-    output: list[Subtitle] = []
-    missing: list[int] = []
-    for original in batch:
-        row = by_id.get(original.index)
-        if not row:
-            missing.append(original.index)
-            continue
-
-        tag = str(row.get("tag", "M")).upper().strip("[] ")
-        if tag not in VALID_TAGS or tag == "UNKNOWN":
-            tag = "M"
-
-        text = normalize_khmer_tts_text(str(row.get("text", "")))
-        if not text:
-            missing.append(original.index)
-            continue
-
-        output.append(
-            Subtitle(
-                index=original.index,
-                start_ms=original.start_ms,
-                end_ms=original.end_ms,
-                text=text,
-                tag=tag,
+            response = gemini_client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=(
+                    f"{translation_prompt()}\n\n"
+                    f"EXPECTED_BLOCK_COUNT: {len(expected_signature)}\n\n"
+                    f"INPUT SRT:\n{source_srt}"
+                ),
             )
-        )
+            response_text = getattr(response, "text", None)
+            if not response_text:
+                raise RuntimeError("Gemini returned an empty response")
 
-    if missing:
-        raise ValueError(f"Gemini omitted or invalidated subtitle ids: {missing}")
+            result = clean_gemini_output(response_text)
+            actual_signature = srt_signature(result)
 
-    return output
+            if actual_signature != expected_signature:
+                raise RuntimeError(
+                    "Gemini changed subtitle numbering or timestamps"
+                )
+            if contains_chinese(result):
+                raise RuntimeError("Chinese characters remained in Khmer SRT")
 
+            # Validate every translated cue before accepting the response.
+            parsed = parse_tagged_srt(result)
+            if len(parsed) != len(expected_signature):
+                raise RuntimeError(
+                    f"Parsed cue mismatch: expected {len(expected_signature)}, "
+                    f"got {len(parsed)}"
+                )
+            return result + "\n"
 
-async def translate_subtitles(subtitles: list[Subtitle]) -> list[Subtitle]:
-    translated: list[Subtitle] = []
-    batches = make_translation_batches(subtitles)
-    for number, batch in enumerate(batches, start=1):
-        logger.info("Translating batch %s/%s", number, len(batches))
-        translated.extend(await translate_batch(batch, translated))
-    translated.sort(key=lambda item: item.index)
-    return translated
-
-
-# =============================================================================
-# TTS grouping, synthesis, and timeline construction
-# =============================================================================
-
-def build_tts_groups(
-    subtitles: list[Subtitle],
-    *,
-    max_gap_ms: int = 220,
-    max_group_ms: int = 11_000,
-    max_chars: int = 180,
-) -> list[TTSGroup]:
-    """
-    Join only short, consecutive lines from the same speaker. This reduces tone
-    resets while preserving SRT timing. It intentionally does not group different
-    speakers or large pauses.
-    """
-    groups: list[TTSGroup] = []
-    current: Optional[TTSGroup] = None
-
-    for sub in subtitles:
-        text = normalize_khmer_tts_text(sub.text)
-        if not text:
-            continue
-
-        can_join = (
-            current is not None
-            and current.tag == sub.tag
-            and 0 <= sub.start_ms - current.end_ms <= max_gap_ms
-            and sub.end_ms - current.start_ms <= max_group_ms
-            and len(current.text) + len(text) + 2 <= max_chars
-        )
-        if can_join:
-            current.text = f"{current.text}។ {text}"
-            current.end_ms = sub.end_ms
-            current.members.append(sub)
-        else:
-            current = TTSGroup(
-                tag=sub.tag,
-                start_ms=sub.start_ms,
-                end_ms=sub.end_ms,
-                text=text,
-                members=[sub],
-            )
-            groups.append(current)
-
-    return groups
-
-
-async def synthesize_tts(group: TTSGroup, output_mp3: Path) -> None:
-    profile = VOICE_PROFILES.get(group.tag, VOICE_PROFILES["M"])
-    text = normalize_khmer_tts_text(group.text)
-    if not text:
-        raise ValueError("Cannot synthesize empty TTS text.")
-
-    last_error: Optional[Exception] = None
-    for attempt in range(1, TTS_RETRIES + 1):
-        try:
-            communicate = edge_tts.Communicate(
-                text=text,
-                voice=profile["voice"],
-                rate=profile["rate"],
-                volume=profile["volume"],
-                pitch=profile["pitch"],
-            )
-            await asyncio.wait_for(communicate.save(str(output_mp3)), timeout=180)
-            if not output_mp3.exists() or output_mp3.stat().st_size < 256:
-                raise RuntimeError("Edge-TTS produced an empty audio file.")
-            return
         except Exception as exc:
             last_error = exc
-            output_mp3.unlink(missing_ok=True)
-            if attempt >= TTS_RETRIES:
-                break
-            await asyncio.sleep(min(8, 2 ** (attempt - 1)))
-    raise RuntimeError(f"Edge-TTS failed after {TTS_RETRIES} attempts: {last_error}")
+            logger.warning(
+                "Translation attempt %s/%s failed: %s",
+                attempt,
+                TRANSLATION_RETRIES,
+                exc,
+            )
+            if attempt < TRANSLATION_RETRIES:
+                time.sleep(retry_delay_from_error(exc, attempt))
 
-
-async def convert_clip_to_wav(source_mp3: Path, output_wav: Path) -> None:
-    await run_command(
-        [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-i", str(source_mp3),
-            "-ac", "1",
-            "-ar", str(AUDIO_SAMPLE_RATE),
-            "-c:a", "pcm_s16le",
-            "-af", "afade=t=in:st=0:d=0.015,areverse,"
-                   "afade=t=in:st=0:d=0.02,areverse,"
-                   "loudnorm=I=-18:TP=-2:LRA=8",
-            str(output_wav),
-        ],
-        timeout=180,
+    raise RuntimeError(
+        f"Translation failed after {TRANSLATION_RETRIES} attempts: {last_error}"
     )
 
 
-async def clip_duration_ms(path: Path) -> int:
-    return await probe_duration_ms(path)
+def parse_tagged_srt(srt_text: str) -> list[SubtitleCue]:
+    cues: list[SubtitleCue] = []
+
+    for block in split_srt_blocks(srt_text):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if len(lines) < 3:
+            raise ValueError(f"Invalid subtitle block: {block[:120]!r}")
+
+        index = int(lines[0])
+        time_match = re.fullmatch(
+            r"(\d{1,3}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*"
+            r"(\d{1,3}:\d{2}:\d{2}[,.]\d{3})",
+            lines[1],
+        )
+        if not time_match:
+            raise ValueError(f"Invalid timestamp for cue {index}: {lines[1]!r}")
+
+        dialogue = " ".join(lines[2:]).strip()
+        tag_match = re.fullmatch(
+            r"\[([A-Z_]+)\]\[([A-Z_]+)\]\s*(.+)",
+            dialogue,
+            flags=re.S,
+        )
+        if not tag_match:
+            raise ValueError(
+                f"Cue {index} is missing a valid [VOICE][EMOTION] prefix"
+            )
+
+        tag, emotion, text = tag_match.groups()
+        if tag not in VALID_TAGS:
+            raise ValueError(f"Unsupported voice tag [{tag}] at cue {index}")
+        if emotion not in VALID_EMOTIONS:
+            raise ValueError(f"Unsupported emotion [{emotion}] at cue {index}")
+
+        text = re.sub(r"<[^>]+>", "", text).strip()
+        if not text:
+            raise ValueError(f"Cue {index} has empty dialogue")
+
+        start = time_to_seconds(time_match.group(1))
+        end = time_to_seconds(time_match.group(2))
+        if end <= start:
+            raise ValueError(f"Cue {index} has end time <= start time")
+
+        cues.append(
+            SubtitleCue(
+                index=index,
+                start=start,
+                end=end,
+                tag=tag,
+                emotion=emotion,
+                text=text,
+            )
+        )
+
+    return sorted(cues, key=lambda cue: (cue.start, cue.index))
 
 
-def atempo_chain(speed: float) -> str:
-    """
-    FFmpeg atempo accepts 0.5..100 in recent builds, but chaining near 1.0 is
-    safer and easier to reason about. speed > 1 makes speech shorter.
-    """
-    speed = max(0.85, min(speed, 1.18))
-    return f"atempo={speed:.5f}"
+# ---------------------------------------------------------------------------
+# Whisper, FFmpeg and TTS
+# ---------------------------------------------------------------------------
+
+def get_whisper_model() -> WhisperModel:
+    global _whisper_model
+    if _whisper_model is None:
+        logger.info(
+            "Loading Whisper model=%s device=%s compute_type=%s",
+            WHISPER_MODEL,
+            WHISPER_DEVICE,
+            WHISPER_COMPUTE_TYPE,
+        )
+        _whisper_model = WhisperModel(
+            WHISPER_MODEL,
+            device=WHISPER_DEVICE,
+            compute_type=WHISPER_COMPUTE_TYPE,
+        )
+    return _whisper_model
 
 
-async def fit_clip_safely(
-    input_wav: Path,
-    output_wav: Path,
-    available_ms: int,
-) -> None:
-    duration = await clip_duration_ms(input_wav)
-    if duration <= available_ms or available_ms <= 0:
-        shutil.copy2(input_wav, output_wav)
-        return
+def run_command(command: list[str], timeout: int = SUBPROCESS_TIMEOUT_SECONDS) -> None:
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Command timed out after {timeout}s: {command[0]}"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(f"Could not run {command[0]}: {exc}") from exc
 
-    required_speed = duration / max(1, available_ms)
-    if required_speed <= 1.18:
-        await run_command(
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        raise RuntimeError(
+            f"{command[0]} failed with exit code {result.returncode}:\n"
+            f"{stderr[-2500:]}"
+        )
+
+
+def ffprobe_duration(media_path: Path) -> float:
+    try:
+        result = subprocess.run(
             [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                "-i", str(input_wav),
-                "-filter:a", atempo_chain(required_speed),
-                "-ac", "1",
-                "-ar", str(AUDIO_SAMPLE_RATE),
-                "-c:a", "pcm_s16le",
-                str(output_wav),
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(media_path),
             ],
-            timeout=180,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
         )
-    else:
-        # Do not aggressively accelerate or cut speech. Preserve it and log that
-        # it may overlap the following segment.
-        logger.warning(
-            "TTS clip %s needs unsafe speed %.3f; preserving natural speech.",
-            input_wav.name,
-            required_speed,
-        )
-        shutil.copy2(input_wav, output_wav)
+        duration = float(result.stdout.strip())
+    except (subprocess.SubprocessError, ValueError, OSError) as exc:
+        raise RuntimeError(f"Could not read media duration: {exc}") from exc
+
+    if duration <= 0:
+        raise RuntimeError("Media duration is zero or invalid")
+    return duration
 
 
-async def create_silence_wav(duration_ms: int, output_wav: Path) -> None:
-    duration_sec = max(0.001, duration_ms / 1000)
-    await run_command(
+def validate_media_duration(media_path: Path) -> None:
+    duration = ffprobe_duration(media_path)
+    if duration > MAX_MEDIA_SECONDS + 0.5:
+        raise ValueError(
+            f"ឯកសារវែងជាង {MAX_MEDIA_SECONDS // 60} នាទី។ "
+            f"សូមកាត់ឱ្យខ្លីជាងនេះ។"
+        )
+
+
+def extract_audio(video_path: Path, audio_path: Path) -> None:
+    run_command(
         [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-f", "lavfi",
-            "-i", f"anullsrc=r={AUDIO_SAMPLE_RATE}:cl=mono",
-            "-t", f"{duration_sec:.3f}",
-            "-c:a", "pcm_s16le",
-            str(output_wav),
-        ],
-        timeout=180,
-    )
-
-
-async def mix_group_clips(
-    clips: list[tuple[int, Path]],
-    total_duration_ms: int,
-    output_mp3: Path,
-) -> None:
-    if not clips:
-        raise RuntimeError("No generated TTS clips to combine.")
-
-    args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
-    for _, clip in clips:
-        args.extend(["-i", str(clip)])
-
-    filters: list[str] = []
-    labels: list[str] = []
-    for index, (start_ms, _) in enumerate(clips):
-        label = f"a{index}"
-        filters.append(
-            f"[{index}:a]adelay={max(0, start_ms)}|{max(0, start_ms)},"
-            f"aresample={AUDIO_SAMPLE_RATE},aformat=sample_fmts=fltp:"
-            f"sample_rates={AUDIO_SAMPLE_RATE}:channel_layouts=mono[{label}]"
-        )
-        labels.append(f"[{label}]")
-
-    filters.append(
-        f"{''.join(labels)}amix=inputs={len(labels)}:duration=longest:"
-        f"dropout_transition=0,alimiter=limit=0.95,"
-        f"apad=whole_dur={max(0.1, total_duration_ms / 1000):.3f},"
-        f"atrim=0:{max(0.1, total_duration_ms / 1000):.3f}[out]"
-    )
-
-    args.extend(
-        [
-            "-filter_complex", ";".join(filters),
-            "-map", "[out]",
-            "-ac", "1",
-            "-ar", str(AUDIO_SAMPLE_RATE),
-            "-c:a", "libmp3lame",
-            "-b:a", AUDIO_BITRATE,
-            str(output_mp3),
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_path),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            str(audio_path),
         ]
     )
-    await run_command(args, timeout=3600)
 
 
-async def generate_dubbed_mp3(
-    project: Project,
-    subtitles: list[Subtitle],
-    context: ContextTypes.DEFAULT_TYPE,
-) -> Path:
-    groups = build_tts_groups(subtitles)
-    if not groups:
-        raise RuntimeError("The SRT contains no usable Khmer dialogue.")
+def transcribe_to_srt(media_path: Path) -> str:
+    model = get_whisper_model()
+    segments, _info = model.transcribe(
+        str(media_path),
+        language="zh",
+        vad_filter=True,
+        beam_size=1,
+        best_of=1,
+        condition_on_previous_text=False,
+        temperature=0.0,
+    )
 
-    tts_dir = project.root / "tts"
-    tts_dir.mkdir(parents=True, exist_ok=True)
-    tts_semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
+    blocks: list[str] = []
+    for output_index, segment in enumerate(segments, start=1):
+        line = segment.text.strip()
+        if not line:
+            continue
+        blocks.append(
+            f"{len(blocks) + 1}\n"
+            f"{srt_time(segment.start)} --> {srt_time(segment.end)}\n"
+            f"{line}"
+        )
 
-    async def create_one(index: int, group: TTSGroup) -> tuple[int, Path]:
-        if project.cancelled:
-            raise asyncio.CancelledError
-        raw_mp3 = tts_dir / f"{index:05d}_raw.mp3"
-        normalized_wav = tts_dir / f"{index:05d}_normalized.wav"
-        fitted_wav = tts_dir / f"{index:05d}_fitted.wav"
+    if not blocks:
+        raise RuntimeError("No Chinese speech was detected in this media")
+    return "\n\n".join(blocks) + "\n"
 
-        async with tts_semaphore:
-            await synthesize_tts(group, raw_mp3)
-        await convert_clip_to_wav(raw_mp3, normalized_wav)
 
-        # Give a little room up to the next group's start, but never use a
-        # negative window. This helps avoid cutting final syllables.
-        next_start = groups[index + 1].start_ms if index + 1 < len(groups) else group.end_ms + 700
-        available = max(group.end_ms - group.start_ms, next_start - group.start_ms - 40)
-        await fit_clip_safely(normalized_wav, fitted_wav, available)
-        return group.start_ms, fitted_wav
+def parse_signed_number(value: str) -> int:
+    match = re.search(r"[-+]?\d+", value)
+    return int(match.group()) if match else 0
 
-    tasks = [asyncio.create_task(create_one(i, group)) for i, group in enumerate(groups)]
-    completed: list[tuple[int, Path]] = []
+
+def combined_voice_settings(cue: SubtitleCue) -> dict[str, str]:
+    profile = VOICE_PROFILES[cue.tag]
+    emotion = EMOTION_ADJUSTMENTS[cue.emotion]
+
+    rate = parse_signed_number(profile["rate"]) + emotion["rate"]
+    pitch = parse_signed_number(profile["pitch"]) + emotion["pitch"]
+    volume = parse_signed_number(profile["volume"]) + emotion["volume"]
+
+    return {
+        "voice": profile["voice"],
+        "rate": f"{max(-25, min(25, rate)):+d}%",
+        "pitch": f"{max(-25, min(25, pitch)):+d}Hz",
+        "volume": f"{max(-15, min(10, volume)):+d}%",
+    }
+
+
+async def synthesize_with_retry(cue: SubtitleCue, output_path: Path) -> None:
+    settings = combined_voice_settings(cue)
+    last_error: Exception | None = None
+
+    for attempt in range(1, MAX_TTS_RETRIES + 1):
+        try:
+            output_path.unlink(missing_ok=True)
+            communicate = edge_tts.Communicate(
+                text=cue.text,
+                voice=settings["voice"],
+                rate=settings["rate"],
+                pitch=settings["pitch"],
+                volume=settings["volume"],
+            )
+            await asyncio.wait_for(
+                communicate.save(str(output_path)),
+                timeout=TTS_TIMEOUT_SECONDS,
+            )
+            if not output_path.exists() or output_path.stat().st_size < 100:
+                raise RuntimeError("Generated TTS audio is empty")
+            return
+        except asyncio.CancelledError:
+            output_path.unlink(missing_ok=True)
+            raise
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "TTS cue=%s attempt=%s/%s failed: %s",
+                cue.index,
+                attempt,
+                MAX_TTS_RETRIES,
+                exc,
+            )
+            if attempt < MAX_TTS_RETRIES:
+                await asyncio.sleep(min(2 * attempt, 6))
+
+    raise RuntimeError(
+        f"TTS failed for subtitle {cue.index}: {last_error}"
+    )
+
+
+async def prepare_cue_audio(
+    position: int,
+    cue: SubtitleCue,
+    workdir: Path,
+    semaphore: asyncio.Semaphore,
+) -> tuple[int, Path, int]:
+    raw_path = workdir / f"cue_{position:05d}_raw.mp3"
+    fit_path = workdir / f"cue_{position:05d}_fit.wav"
+
+    async with semaphore:
+        await synthesize_with_retry(cue, raw_path)
+
+    raw_duration = await asyncio.to_thread(ffprobe_duration, raw_path)
+    target_duration = max(0.25, cue.end - cue.start)
+    speed = max(MIN_SPEED, min(MAX_SPEED, raw_duration / target_duration))
+
+    fade_out_start = max(0.0, target_duration - 0.035)
+    audio_filter = (
+        f"atempo={speed:.6f},"
+        "highpass=f=70,"
+        "lowpass=f=12500,"
+        "afade=t=in:st=0:d=0.025,"
+        f"afade=t=out:st={fade_out_start:.3f}:d=0.035,"
+        f"apad=pad_dur={target_duration:.3f},"
+        f"atrim=0:{target_duration:.3f},"
+        "aresample=48000"
+    )
+
+    await asyncio.to_thread(
+        run_command,
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(raw_path),
+            "-filter:a",
+            audio_filter,
+            "-ac",
+            "2",
+            "-c:a",
+            "pcm_s16le",
+            str(fit_path),
+        ],
+    )
+    return position, fit_path, round(cue.start * 1000)
+
+
+async def create_timed_dub_mp3(
+    cues: list[SubtitleCue],
+    output_path: Path,
+    workdir: Path,
+    progress: ProgressCallback | None = None,
+) -> None:
+    if not cues:
+        raise RuntimeError("No subtitle cues were provided for TTS")
+
+    semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
+    tasks = [
+        asyncio.create_task(
+            prepare_cue_audio(i, cue, workdir, semaphore),
+            name=f"tts-cue-{cue.index}",
+        )
+        for i, cue in enumerate(cues, start=1)
+    ]
+
+    results: list[tuple[int, Path, int]] = []
     try:
-        for done_number, future in enumerate(asyncio.as_completed(tasks), start=1):
-            completed.append(await future)
-            if done_number == 1 or done_number == len(tasks) or done_number % 5 == 0:
-                percent = round(done_number * 100 / len(tasks))
-                await update_progress(
-                    context,
-                    project,
-                    f"{PROGRESS_TEXT['tts']}\n{done_number}/{len(tasks)} ({percent}%)",
+        for completed, task in enumerate(asyncio.as_completed(tasks), start=1):
+            results.append(await task)
+            if progress:
+                await progress(
+                    45 + round((completed / len(tasks)) * 40),
+                    f"កំពុងបង្កើតសំឡេងខ្មែរ ({completed}/{len(tasks)})",
                 )
-    except Exception:
+    except BaseException:
         for task in tasks:
-            task.cancel()
+            if not task.done():
+                task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
 
-    completed.sort(key=lambda pair: pair[0])
-    total_duration = max(
-        await probe_duration_ms(project.source_path) if project.source_path else 1,
-        max(item.end_ms for item in subtitles) + 700,
+    results.sort(key=lambda item: item[0])
+    if len(results) != len(cues):
+        raise RuntimeError("Some subtitle audio files are missing")
+
+    if progress:
+        await progress(88, "កំពុងតម្រៀបសំឡេងតាម Timestamp")
+
+    command = ["ffmpeg", "-y"]
+    for _position, path, _delay in results:
+        command.extend(["-i", str(path)])
+
+    filter_parts: list[str] = []
+    labels: list[str] = []
+    for input_index, (_position, _path, delay_ms) in enumerate(results):
+        label = f"a{input_index}"
+        filter_parts.append(
+            f"[{input_index}:a]adelay={delay_ms}:all=1[{label}]"
+        )
+        labels.append(f"[{label}]")
+
+    total_duration = max(cue.end for cue in cues) + 0.30
+    filter_parts.append(
+        f"{''.join(labels)}"
+        f"amix=inputs={len(labels)}:duration=longest:dropout_transition=0,"
+        "dynaudnorm=f=150:g=7,"
+        "alimiter=limit=0.92,"
+        f"atrim=0:{total_duration:.3f}[mix]"
     )
 
-    output = project.root / "KhmerDubAI_V10_dubbed.mp3"
-    await update_progress(context, project, PROGRESS_TEXT["combine"])
-    await mix_group_clips(completed, total_duration, output)
-    project.dubbed_mp3 = output
-    return output
+    command.extend(
+        [
+            "-filter_complex",
+            ";".join(filter_parts),
+            "-map",
+            "[mix]",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "160k",
+            str(output_path),
+        ]
+    )
+    await asyncio.to_thread(run_command, command)
+
+    if not output_path.exists() or output_path.stat().st_size < 1000:
+        raise RuntimeError("Final Khmer MP3 was not created correctly")
 
 
-# =============================================================================
-# MP4 creation
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Progress and processing
+# ---------------------------------------------------------------------------
 
-async def create_dubbed_video(project: Project, mode: str) -> Path:
-    if not project.source_path or not is_video(project.source_path):
-        raise RuntimeError("MP4 generation requires an uploaded video file.")
-    if not project.dubbed_mp3 or not project.dubbed_mp3.exists():
-        raise RuntimeError("Generate the Khmer MP3 before creating MP4.")
-
-    output = project.root / f"KhmerDubAI_V10_{mode}.mp4"
-
-    if mode == "replace":
-        await run_command(
-            [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                "-i", str(project.source_path),
-                "-i", str(project.dubbed_mp3),
-                "-map", "0:v:0",
-                "-map", "1:a:0",
-                "-c:v", "copy",
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-shortest",
-                "-movflags", "+faststart",
-                str(output),
-            ],
-            timeout=7200,
-        )
-    elif mode == "mix":
-        await run_command(
-            [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                "-i", str(project.source_path),
-                "-i", str(project.dubbed_mp3),
-                "-filter_complex",
-                f"[0:a]volume={MIX_ORIGINAL_VOLUME}[orig];"
-                f"[1:a]volume=1.0[dub];"
-                f"[orig][dub]amix=inputs=2:duration=first:dropout_transition=2,"
-                f"alimiter=limit=0.95[mix]",
-                "-map", "0:v:0",
-                "-map", "[mix]",
-                "-c:v", "copy",
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-shortest",
-                "-movflags", "+faststart",
-                str(output),
-            ],
-            timeout=7200,
-        )
-    else:
-        raise ValueError("Invalid audio mode.")
-
-    project.dubbed_mp4 = output
-    return output
+def progress_bar(percent: int) -> str:
+    percent = max(0, min(100, percent))
+    filled = round(percent / 10)
+    return "█" * filled + "░" * (10 - filled)
 
 
-# =============================================================================
-# Telegram helpers
-# =============================================================================
-
-async def send_with_retry(
-    callable_obj: Any,
-    *args: Any,
-    attempts: int = 3,
-    **kwargs: Any,
-) -> Any:
-    last_error: Optional[Exception] = None
-    for attempt in range(1, attempts + 1):
-        try:
-            return await callable_obj(*args, **kwargs)
-        except RetryAfter as exc:
-            last_error = exc
-            await asyncio.sleep(float(exc.retry_after) + 0.5)
-        except (TimedOut, NetworkError) as exc:
-            last_error = exc
-            if attempt < attempts:
-                await asyncio.sleep(2 ** (attempt - 1))
-        except TelegramError:
-            raise
-    raise RuntimeError(f"Telegram operation failed: {last_error}") from last_error
-
-
-async def send_output_file(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    path: Path,
-    *,
-    caption: str,
-    as_video: bool = False,
+async def update_progress(
+    message: Message,
+    percent: int,
+    label: str,
+    state: dict[str, int],
 ) -> None:
-    if not path.exists():
-        raise FileNotFoundError(path)
-    if path.stat().st_size > TELEGRAM_SEND_LIMIT_BYTES:
-        await context.bot.send_message(
-            chat_id,
-            f"⚠️ ឯកសារ {path.name} មានទំហំធំពេកសម្រាប់ការកំណត់ផ្ញើរបស់ Bot "
-            f"({TELEGRAM_SEND_LIMIT_MB} MB)។ ឯកសារនៅលើម៉ាស៊ីនមេ៖ {path.name}",
-        )
+    percent = max(0, min(100, int(percent)))
+    last_percent = state.get("last_percent", -10)
+
+    if percent < 100 and percent - last_percent < 5:
         return
 
-    with path.open("rb") as handle:
-        if as_video:
-            await send_with_retry(
-                context.bot.send_video,
-                chat_id=chat_id,
-                video=handle,
-                caption=caption,
-                supports_streaming=True,
-                read_timeout=300,
-                write_timeout=300,
-                connect_timeout=60,
-                pool_timeout=60,
-            )
-        else:
-            await send_with_retry(
-                context.bot.send_document,
-                chat_id=chat_id,
-                document=handle,
-                filename=path.name,
-                caption=caption,
-                read_timeout=300,
-                write_timeout=300,
-                connect_timeout=60,
-                pool_timeout=60,
-            )
-
-
-async def get_upload_info(message: Message) -> tuple[Any, str, int]:
-    if message.video:
-        item = message.video
-        return item, sanitize_filename(item.file_name or f"video_{item.file_unique_id}.mp4"), item.file_size or 0
-    if message.audio:
-        item = message.audio
-        return item, sanitize_filename(item.file_name or f"audio_{item.file_unique_id}.mp3"), item.file_size or 0
-    if message.voice:
-        item = message.voice
-        return item, sanitize_filename(f"voice_{item.file_unique_id}.ogg"), item.file_size or 0
-    if message.document:
-        item = message.document
-        filename = sanitize_filename(item.file_name or f"file_{item.file_unique_id}")
-        return item, filename, item.file_size or 0
-    raise ValueError("Unsupported Telegram message type.")
-
-
-async def download_telegram_file(
-    message: Message,
-    destination: Path,
-) -> None:
-    media, _, _ = await get_upload_info(message)
-    telegram_file = await media.get_file()
-    await telegram_file.download_to_drive(custom_path=str(destination))
-
-
-def is_srt_message(message: Message) -> bool:
-    return bool(
-        message.document
-        and message.document.file_name
-        and Path(message.document.file_name).suffix.lower() == ".srt"
+    state["last_percent"] = percent
+    text = (
+        f"⏳ {label}\n"
+        f"<code>{progress_bar(percent)}</code> <b>{percent}%</b>\n\n"
+        "សូមកុំផ្ញើឯកសារថ្មី រហូតដល់ការងារនេះចប់។"
     )
+    try:
+        await message.edit_text(text, parse_mode=ParseMode.HTML)
+    except BadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            logger.debug("Progress update rejected: %s", exc)
+    except RetryAfter as exc:
+        await asyncio.sleep(float(exc.retry_after))
+    except (NetworkError, TimedOut) as exc:
+        logger.debug("Temporary progress update failure: %s", exc)
 
 
-# =============================================================================
-# Core workflows
-# =============================================================================
-
-async def process_new_upload(
+async def send_outputs(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    project: Project,
-    filename: str,
+    status: Message,
+    srt_path: Path,
+    mp3_path: Path,
 ) -> None:
     message = update.effective_message
-    assert message is not None
+    if message is None:
+        raise RuntimeError("Telegram message is unavailable")
+
+    caption_suffix = (
+        f"\n🗑 នឹងលុបក្រោយ {AUTO_DELETE_MINUTES} នាទី"
+        if AUTO_DELETE_MINUTES > 0
+        else ""
+    )
+
+    with srt_path.open("rb") as srt_file:
+        srt_message = await message.reply_document(
+            document=srt_file,
+            filename="khmer_dub.srt",
+            caption="✅ Khmer SRT" + caption_suffix,
+        )
+
+    with mp3_path.open("rb") as mp3_file:
+        mp3_message = await message.reply_audio(
+            audio=mp3_file,
+            filename="khmer_dub.mp3",
+            title="KhmerDubAI Dub",
+            caption="✅ Khmer Dub MP3" + caption_suffix,
+        )
+
+    track_message(srt_message)
+    track_message(mp3_message)
+    schedule_delete(status)
+    schedule_delete(srt_message, DELETE_OUTPUT_MESSAGES)
+    schedule_delete(mp3_message, DELETE_OUTPUT_MESSAGES)
+
+
+async def process_source(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    source_path: Path,
+    tmpdir: Path,
+    is_srt: bool,
+) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+
+    status = await message.reply_text("⏳ កំពុងចាប់ផ្ដើម… 0%")
+    track_message(status)
+    state = {"last_percent": -10}
+
+    async def progress(percent: int, label: str) -> None:
+        session = get_session(chat.id)
+        session.last_activity = time.monotonic()
+        await update_progress(status, percent, label, state)
 
     try:
-        async with JOB_SEMAPHORE:
-            project.processing = True
-            await update_progress(context, project, PROGRESS_TEXT["download"])
-            source = project.root / filename
-            await download_telegram_file(message, source)
-            project.source_path = source
-
-            if project.cancelled:
-                raise asyncio.CancelledError
-
-            await update_progress(context, project, PROGRESS_TEXT["extract"])
-            normalized = project.root / "audio_16k_mono.wav"
-            await extract_normalized_audio(source, normalized)
-            project.normalized_wav = normalized
-
-            await update_progress(context, project, PROGRESS_TEXT["transcribe"])
-            chinese_subtitles = await transcribe_audio(normalized)
-            chinese_srt = project.root / "Chinese_Whisper.srt"
-            # Chinese draft has no final speaker guarantee, but preserves timing.
-            chinese_srt.write_text(
-                "\n\n".join(
-                    f"{i}\n{ms_to_srt(sub.start_ms)} --> {ms_to_srt(sub.end_ms)}\n{sub.text}"
-                    for i, sub in enumerate(chinese_subtitles, start=1)
-                ) + "\n",
-                encoding="utf-8",
+        if is_srt:
+            await progress(5, "កំពុងអានឯកសារ SRT")
+            source_srt = source_path.read_text(
+                encoding="utf-8-sig",
+                errors="replace",
             )
-            project.chinese_srt = chinese_srt
+            srt_signature(source_srt)
+            await progress(15, "កំពុងបកប្រែជាភាសាខ្មែរ")
+        else:
+            media_for_whisper = source_path
+            await progress(3, "កំពុងទទួលឯកសារ")
 
-            await update_progress(context, project, PROGRESS_TEXT["translate"])
-            khmer_subtitles = await translate_subtitles(chinese_subtitles)
+            if source_path.suffix.lower() in VIDEO_SUFFIXES:
+                await progress(8, "កំពុងដកសំឡេងចេញពីវីដេអូ")
+                wav_path = tmpdir / "audio.wav"
+                await asyncio.to_thread(extract_audio, source_path, wav_path)
+                media_for_whisper = wav_path
 
-            await update_progress(context, project, PROGRESS_TEXT["speaker"])
-            # Speaker classification is included in the Gemini translation pass.
-            # Validate again locally to guarantee a usable profile.
-            for sub in khmer_subtitles:
-                if sub.tag not in VALID_TAGS or sub.tag == "UNKNOWN":
-                    sub.tag = "M"
+            await progress(12, "កំពុងស្គាល់សំឡេងចិន")
+            async with _whisper_lock:
+                source_srt = await asyncio.to_thread(
+                    transcribe_to_srt,
+                    media_for_whisper,
+                )
+            await progress(30, "ស្គាល់សំឡេងរួច កំពុងបកប្រែ")
 
-            await update_progress(context, project, PROGRESS_TEXT["srt"])
-            khmer_srt = project.root / "KhmerDubAI_V10_Khmer.srt"
-            khmer_srt.write_text(subtitles_to_srt(khmer_subtitles), encoding="utf-8")
-            project.khmer_srt = khmer_srt
+        khmer_srt = await asyncio.wait_for(
+            asyncio.to_thread(translate_to_khmer_srt, source_srt),
+            timeout=GEMINI_TIMEOUT_SECONDS,
+        )
 
-            await send_output_file(
+        srt_path = tmpdir / "khmer_dub.srt"
+        srt_path.write_text(khmer_srt, encoding="utf-8")
+        cues = parse_tagged_srt(khmer_srt)
+
+        await progress(42, f"បកប្រែរួច {len(cues)} ឃ្លា")
+        mp3_path = tmpdir / "khmer_dub.mp3"
+        await create_timed_dub_mp3(
+            cues,
+            mp3_path,
+            tmpdir,
+            progress=progress,
+        )
+
+        await progress(94, "កំពុងផ្ញើឯកសារទៅ Telegram")
+        await send_outputs(update, status, srt_path, mp3_path)
+        await progress(100, "ការងាររួចរាល់ ✅")
+
+    except asyncio.CancelledError:
+        schedule_delete(status)
+        raise
+    except Exception:
+        schedule_delete(status)
+        raise
+
+
+def safe_filename(original: str | None, fallback: str) -> str:
+    name = Path(original or fallback).name
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
+    return name[:120] or fallback
+
+
+async def run_downloaded_job(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    telegram_media,
+    filename: str,
+    is_srt: bool = False,
+) -> None:
+    chat = update.effective_chat
+    message = update.effective_message
+    if chat is None or message is None:
+        return
+
+    if not await require_project(update, context):
+        return
+    if not await set_processing_task(chat.id):
+        return
+
+    try:
+        if telegram_media.file_size and telegram_media.file_size > MAX_FILE_MB * 1024 * 1024:
+            reply = await message.reply_text(
+                f"ឯកសារធំពេក។ កំណត់បច្ចុប្បន្ន៖ {MAX_FILE_MB} MB"
+            )
+            track_message(reply)
+            return
+
+        if (
+            not is_srt
+            and getattr(telegram_media, "duration", None)
+            and telegram_media.duration > MAX_MEDIA_SECONDS
+        ):
+            reply = await message.reply_text(
+                f"ឯកសារវែងជាង {MAX_MEDIA_SECONDS // 60} នាទី។ "
+                "សូមកាត់ឱ្យខ្លីជាងនេះ។"
+            )
+            track_message(reply)
+            return
+
+        with tempfile.TemporaryDirectory(prefix="khmerdubai_") as tmp:
+            tmpdir = Path(tmp)
+            source_path = tmpdir / safe_filename(filename, "upload.bin")
+
+            telegram_file = await telegram_media.get_file()
+            await telegram_file.download_to_drive(custom_path=source_path)
+
+            if not is_srt:
+                await asyncio.to_thread(validate_media_duration, source_path)
+
+            await process_source(
+                update,
                 context,
-                project.chat_id,
-                khmer_srt,
-                caption="✅ KhmerDubAI V10 — សូមពិនិត្យ SRT មុនបង្កើតសំឡេង។",
-            )
-            await update_progress(context, project, PROGRESS_TEXT["review"])
-            await context.bot.send_message(
-                project.chat_id,
-                "ជ្រើសរើសជំហានបន្ទាប់៖",
-                reply_markup=REVIEW_KEYBOARD,
+                source_path,
+                tmpdir,
+                is_srt=is_srt,
             )
 
     except asyncio.CancelledError:
-        await context.bot.send_message(project.chat_id, "❌ គម្រោងត្រូវបានបោះបង់។")
-    except Exception as exc:
-        logger.exception("Upload processing failed for user %s", project.user_id)
-        await context.bot.send_message(
-            project.chat_id,
-            "❌ ដំណើរការមិនបាន៖\n"
-            f"{str(exc)[:1500]}\n\n"
-            "សូមពិនិត្យ FFmpeg, API key, ទំហំឯកសារ និងសាកល្បងម្ដងទៀត។",
+        notice = await message.reply_text(
+            "🛑 ការងារចាស់ត្រូវបានបញ្ឈប់។ "
+            "អ្នកអាចចាប់ផ្ដើមគម្រោងថ្មីបាន។"
         )
+        track_message(notice)
+        raise
+    except Exception as exc:
+        logger.exception("Processing failed")
+        error_text = str(exc)
+        if len(error_text) > 900:
+            error_text = error_text[:900] + "…"
+        reply = await message.reply_text(
+            f"❌ មានបញ្ហាពេលដំណើរការ៖\n{error_text}"
+        )
+        track_message(reply)
     finally:
-        project.processing = False
+        await clear_processing_task(chat.id)
+        if DELETE_USER_UPLOAD:
+            schedule_delete(message)
 
 
-async def generate_mp3_workflow(
-    context: ContextTypes.DEFAULT_TYPE,
-    project: Project,
-    *,
-    send_file: bool = True,
-) -> Path:
-    if not project.khmer_srt or not project.khmer_srt.exists():
-        raise RuntimeError("Khmer SRT is missing.")
+# ---------------------------------------------------------------------------
+# Handlers
+# ---------------------------------------------------------------------------
 
-    subtitles = parse_srt(project.khmer_srt.read_text(encoding="utf-8-sig"))
-    async with JOB_SEMAPHORE:
-        project.processing = True
-        try:
-            output = await generate_dubbed_mp3(project, subtitles, context)
-            if send_file:
-                await update_progress(context, project, PROGRESS_TEXT["send"])
-                await send_output_file(
-                    context,
-                    project.chat_id,
-                    output,
-                    caption="✅ KhmerDubAI V10 — សំឡេងខ្មែរ MP3 រួចរាល់។",
-                )
-                await context.bot.send_message(
-                    project.chat_id,
-                    "អ្នកអាចបង្កើត MP4 បន្ត ឬ Upload SRT ដែលបានកែ។",
-                    reply_markup=REVIEW_KEYBOARD,
-                )
-            return output
-        finally:
-            project.processing = False
-
-
-async def generate_mp4_workflow(
-    context: ContextTypes.DEFAULT_TYPE,
-    project: Project,
-    mode: str,
-) -> None:
-    # Generate MP3 before acquiring the MP4 semaphore. Acquiring the same
-    # semaphore recursively would deadlock when MAX_CONCURRENT_JOBS=1.
-    if not project.dubbed_mp3 or not project.dubbed_mp3.exists():
-        await generate_mp3_workflow(context, project, send_file=False)
-
-    async with JOB_SEMAPHORE:
-        project.processing = True
-        try:
-            await update_progress(context, project, PROGRESS_TEXT["mp4"])
-            output = await create_dubbed_video(project, mode)
-            await update_progress(context, project, PROGRESS_TEXT["send"])
-            await send_output_file(
-                context,
-                project.chat_id,
-                output,
-                caption=f"✅ KhmerDubAI V10 — MP4 ({mode}) រួចរាល់។",
-                as_video=True,
-            )
-            await context.bot.send_message(
-                project.chat_id,
-                "✅ គម្រោងរួចរាល់។ អ្នកអាច Upload ឯកសារថ្មីបាន។",
-                reply_markup=REVIEW_KEYBOARD,
-            )
-        finally:
-            project.processing = False
-
-
-# =============================================================================
-# Telegram handlers
-# =============================================================================
-
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
     message = update.effective_message
-    if not message:
+    if chat is None or message is None:
         return
-    await message.reply_text(
-        "🤖 KhmerDubAI V10\n\n"
-        "ផ្ញើវីដេអូ ឬសំឡេងភាសាចិនមក Bot៖\n"
-        "MP4 • MKV • MOV • AVI • MP3 • WAV • M4A • OGG\n\n"
-        "Bot នឹងបង្កើត SRT ខ្មែរ ហើយអនុញ្ញាតឱ្យអ្នកពិនិត្យ "
-        "មុនបង្កើត MP3 ឬ MP4។\n\n"
-        f"ទំហំអតិបរមាដែលបានកំណត់៖ {MAX_FILE_MB} MB"
+
+    session = get_session(chat.id)
+    if session.expiry_task and not session.expiry_task.done():
+        session.expiry_task.cancel()
+
+    session.active = False
+    session.processing_task = None
+    session.last_activity = time.monotonic()
+
+    reply = await message.reply_text(
+        "🤖 KhmerDubAI Turbo Server\n\n"
+        "ចុច «🆕 ធ្វើថ្មី» រួចផ្ញើវីដេអូ សំឡេង ឬ SRT រឿងចិន។\n\n"
+        f"⏱ កំណត់៖ {MAX_MEDIA_SECONDS // 60} នាទី ឬតិចជាងនេះ\n"
+        "🎭 បែងចែកប្រុស ស្រី ក្មេង មនុស្សចាស់ និងសំឡេងគិត\n"
+        "📦 លទ្ធផល៖ khmer_dub.srt និង khmer_dub.mp3",
+        reply_markup=PROJECT_KEYBOARD,
+    )
+    track_message(reply)
+
+
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    reply = await message.reply_text(
+        "ℹ️ របៀបប្រើ KhmerDubAI\n\n"
+        "1. ចុច «🆕 ធ្វើថ្មី»\n"
+        f"2. ផ្ញើវីដេអូ សំឡេង ឬ SRT មិនលើស {MAX_MEDIA_SECONDS // 60} នាទី\n"
+        "3. រង់ចាំ Progress 0%–100%\n"
+        "4. ទទួល khmer_dub.srt និង khmer_dub.mp3",
+        reply_markup=PROJECT_KEYBOARD,
+    )
+    track_message(reply)
+
+
+async def new_project(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    chat = update.effective_chat
+    message = update.effective_message
+    if chat is None or message is None:
+        return
+
+    session = get_session(chat.id)
+    async with session.state_lock:
+        running = session.processing_task
+        if running and not running.done() and running is not asyncio.current_task():
+            running.cancel()
+
+        if session.expiry_task and not session.expiry_task.done():
+            session.expiry_task.cancel()
+
+        await clear_previous_project(
+            context.bot,
+            chat.id,
+            keep_message_id=message.message_id,
+        )
+
+        session.generation += 1
+        session.active = True
+        session.last_activity = time.monotonic()
+        session.processing_task = None
+        session.message_ids = {message.message_id}
+
+    reply = await message.reply_text(
+        "✅ Project ថ្មីរួចរាល់។\n\n"
+        "📤 ឥឡូវផ្ញើវីដេអូ សំឡេង ឬ SRT រឿងចិនបាន។\n"
+        f"⏱ រយៈពេលត្រូវត្រឹម {MAX_MEDIA_SECONDS // 60} នាទី ឬតិចជាងនេះ។\n"
+        "📦 Bot នឹងផ្ញើ Khmer SRT និង Khmer MP3។",
+        reply_markup=PROJECT_KEYBOARD,
+    )
+    track_message(reply)
+    touch_session(context, chat.id)
+
+
+async def voice_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+
+    text = " ".join(context.args).strip()
+    if not text and message.reply_to_message:
+        text = (message.reply_to_message.text or "").strip()
+
+    if not text:
+        reply = await message.reply_text(
+            "ប្រើ៖ /voice អត្ថបទខ្មែរ\n"
+            "ឬ Reply លើសារខ្មែរ ហើយផ្ញើ /voice"
+        )
+        schedule_delete(reply)
+        return
+
+    if len(text) > 3000:
+        reply = await message.reply_text(
+            "អត្ថបទវែងពេក។ /voice អនុញ្ញាតអតិបរមា 3000 តួអក្សរ។"
+        )
+        schedule_delete(reply)
+        return
+
+    with tempfile.TemporaryDirectory(prefix="khmerdubai_voice_") as tmp:
+        output_path = Path(tmp) / "khmer_voice.mp3"
+        try:
+            await message.chat.send_action(ChatAction.RECORD_VOICE)
+            await asyncio.wait_for(
+                edge_tts.Communicate(
+                    text=text,
+                    voice=MALE_VOICE,
+                ).save(str(output_path)),
+                timeout=TTS_TIMEOUT_SECONDS,
+            )
+            with output_path.open("rb") as audio:
+                result = await message.reply_audio(
+                    audio=audio,
+                    filename="khmer_voice.mp3",
+                    title="KhmerDubAI Voice",
+                    caption=(
+                        f"🗑 នឹងលុបក្រោយ {AUTO_DELETE_MINUTES} នាទី"
+                        if AUTO_DELETE_MINUTES > 0
+                        else None
+                    ),
+                )
+            schedule_delete(result, DELETE_OUTPUT_MESSAGES)
+        except Exception as exc:
+            logger.exception("/voice TTS failed")
+            reply = await message.reply_text(
+                f"❌ មិនអាចបង្កើតសំឡេងបាន៖ {exc}"
+            )
+            schedule_delete(reply)
+
+
+async def handle_document(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    if message is None or message.document is None:
+        return
+
+    document = message.document
+    filename = safe_filename(document.file_name, "document")
+    suffix = Path(filename).suffix.lower()
+
+    if suffix not in SUPPORTED_DOCUMENT_SUFFIXES:
+        reply = await message.reply_text(
+            "សូមផ្ញើ SRT, MP3, M4A, WAV, OGG, AAC, FLAC ឬ Video។"
+        )
+        track_message(reply)
+        return
+
+    await run_downloaded_job(
+        update,
+        context,
+        document,
+        filename,
+        is_srt=(suffix == ".srt"),
     )
 
 
-async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await start_handler(update, context)
-
-
-async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
-    user = update.effective_user
+async def handle_audio(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
     message = update.effective_message
-    if not user or not message:
-        return
-
-    project = PROJECTS.pop(user.id, None)
-    if not project:
-        await message.reply_text("មិនមានគម្រោងកំពុងដំណើរការទេ។")
-        return
-
-    project.cancelled = True
-    project.cleanup()
-    await message.reply_text("❌ បានបោះបង់ និងសម្អាតគម្រោងរបស់អ្នក។")
+    if message and message.audio:
+        filename = safe_filename(message.audio.file_name, "audio.mp3")
+        await run_downloaded_job(
+            update,
+            context,
+            message.audio,
+            filename,
+        )
 
 
-async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
+async def handle_voice(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
     message = update.effective_message
-    chat = update.effective_chat
-    if not user or not message or not chat:
-        return
-
-    # Edited SRT is handled before generic document validation.
-    current = PROJECTS.get(user.id)
-    if is_srt_message(message) and current and current.waiting_for_srt:
-        await edited_srt_handler(update, context)
-        return
-
-    try:
-        media, filename, file_size = await get_upload_info(message)
-        del media
-    except ValueError:
-        await message.reply_text("សូមផ្ញើវីដេអូ សំឡេង ឬ Telegram Voice។")
-        return
-
-    suffix = Path(filename).suffix.lower()
-    if suffix not in ALLOWED_EXTENSIONS:
-        await message.reply_text(
-            "❌ ប្រភេទឯកសារមិនគាំទ្រ។\n"
-            "គាំទ្រ៖ MP4, MKV, MOV, AVI, MP3, WAV, M4A, OGG និង Telegram Voice។"
+    if message and message.voice:
+        await run_downloaded_job(
+            update,
+            context,
+            message.voice,
+            "voice.ogg",
         )
-        return
-
-    if file_size and file_size > MAX_FILE_BYTES:
-        await message.reply_text(
-            f"❌ ឯកសារធំពេក។ កំណត់បច្ចុប្បន្នគឺ {MAX_FILE_MB} MB។"
-        )
-        return
-
-    try:
-        require_system_tools()
-    except RuntimeError as exc:
-        await message.reply_text(f"❌ {exc}")
-        return
-
-    lock = get_user_lock(user.id)
-    if lock.locked():
-        await message.reply_text("⏳ គម្រោងរបស់អ្នកកំពុងដំណើរការ។ សូមរង់ចាំ ឬប្រើ /cancel។")
-        return
-
-    async with lock:
-        project = new_project(user.id, chat.id)
-        progress = await message.reply_text(PROGRESS_TEXT["download"])
-        project.progress_message_id = progress.message_id
-        await process_new_upload(update, context, project, filename)
 
 
-async def edited_srt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
+async def handle_video(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
     message = update.effective_message
-    if not user or not message or not message.document:
-        return
-
-    try:
-        project = get_project(user.id)
-    except RuntimeError as exc:
-        await message.reply_text(str(exc))
-        return
-
-    if not project.waiting_for_srt:
-        await message.reply_text(
-            "ចុច “Upload Edited SRT” ជាមុនសិន ដើម្បីជំនួសឯកសារ SRT។"
-        )
-        return
-
-    if project.processing:
-        await message.reply_text("⏳ Bot កំពុងដំណើរការ។ សូមរង់ចាំ។")
-        return
-
-    uploaded = project.root / "uploaded_edited.srt"
-    try:
-        telegram_file = await message.document.get_file()
-        await telegram_file.download_to_drive(custom_path=str(uploaded))
-        raw = uploaded.read_text(encoding="utf-8-sig")
-        subtitles = parse_srt(raw)
-        canonical = subtitles_to_srt(subtitles)
-
-        final_srt = project.root / "KhmerDubAI_V10_Khmer_Edited.srt"
-        final_srt.write_text(canonical, encoding="utf-8")
-        project.khmer_srt = final_srt
-        project.waiting_for_srt = False
-        project.dubbed_mp3 = None
-        project.dubbed_mp4 = None
-
-        await message.reply_text(
-            f"✅ បានទទួល និងពិនិត្យ SRT រួច៖ {len(subtitles)} ប្លុក។",
-            reply_markup=REVIEW_KEYBOARD,
-        )
-    except (UnicodeError, ValueError, TelegramError) as exc:
-        logger.warning("Invalid edited SRT from user %s: %s", user.id, exc)
-        await message.reply_text(
-            "❌ SRT មិនត្រឹមត្រូវ៖\n"
-            f"{str(exc)[:1000]}\n\n"
-            "ទម្រង់ត្រូវមានលេខ, timestamp និង [TAG] សន្ទនា។"
+    if message and message.video:
+        filename = safe_filename(message.video.file_name, "video.mp4")
+        await run_downloaded_job(
+            update,
+            context,
+            message.video,
+            filename,
         )
 
 
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    user = update.effective_user
-    if not query or not user:
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if isinstance(context.error, asyncio.CancelledError):
         return
-
-    await query.answer()
-    data = query.data or ""
-
-    try:
-        project = get_project(user.id)
-    except RuntimeError as exc:
-        await query.message.reply_text(str(exc))
-        return
-
-    if data == "v10:cancel":
-        project.cancelled = True
-        PROJECTS.pop(user.id, None)
-        project.cleanup()
-        await query.edit_message_text("❌ បានបោះបង់ និងសម្អាតគម្រោង។")
-        return
-
-    if data == "v10:back":
-        await query.edit_message_text("ជ្រើសរើសជំហានបន្ទាប់៖", reply_markup=REVIEW_KEYBOARD)
-        return
-
-    if data == "v10:upload_srt":
-        project.waiting_for_srt = True
-        await query.edit_message_text(
-            "📄 សូមផ្ញើឯកសារ .srt ដែលអ្នកបានកែ មកក្នុង Chat នេះ។\n\n"
-            "Bot នឹងពិនិត្យ tag និង timestamp មុនបង្កើតសំឡេង។"
-        )
-        return
-
-    if project.processing:
-        await query.message.reply_text("⏳ គម្រោងកំពុងដំណើរការ។ សូមរង់ចាំ។")
-        return
-
-    if data == "v10:mp3":
-        await query.edit_message_text("🎧 បានចាប់ផ្ដើមបង្កើត MP3…")
-        try:
-            await generate_mp3_workflow(context, project)
-        except Exception as exc:
-            logger.exception("MP3 workflow failed for user %s", user.id)
-            await query.message.reply_text(f"❌ បង្កើត MP3 មិនបាន៖\n{str(exc)[:1500]}")
-        return
-
-    if data == "v10:mp4":
-        if not project.source_path or not is_video(project.source_path):
-            await query.message.reply_text("❌ អ្នកបាន Upload សំឡេង មិនមែនវីដេអូទេ។")
-            return
-        await query.edit_message_text(
-            "ជ្រើសរើសរបៀបសំឡេងសម្រាប់ MP4៖",
-            reply_markup=AUDIO_MODE_KEYBOARD,
-        )
-        return
-
-    if data in {"v10:mp4:replace", "v10:mp4:mix"}:
-        mode = data.rsplit(":", 1)[-1]
-        await query.edit_message_text(f"🎬 បានចាប់ផ្ដើមបង្កើត MP4 ({mode})…")
-        try:
-            await generate_mp4_workflow(context, project, mode)
-        except Exception as exc:
-            logger.exception("MP4 workflow failed for user %s", user.id)
-            await query.message.reply_text(f"❌ បង្កើត MP4 មិនបាន៖\n{str(exc)[:1500]}")
-        return
-
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
-    message = update.effective_message
-    if message:
-        await message.reply_text(
-            "សូមផ្ញើវីដេអូ/សំឡេង ឬប្រើ /start ដើម្បីមើលការណែនាំ។"
-        )
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Unhandled Telegram error", exc_info=context.error)
-    if isinstance(update, Update) and update.effective_chat:
-        try:
-            await context.bot.send_message(
-                update.effective_chat.id,
-                "❌ Bot ជួបបញ្ហាដែលមិនបានរំពឹងទុក។ សូមសាកល្បងម្ដងទៀត។",
-            )
-        except TelegramError:
-            pass
-
-
-async def post_init(application: Application) -> None:
-    require_system_tools()
-    me = await application.bot.get_me()
-    logger.info("KhmerDubAI V10 started as @%s", me.username)
+    logger.error(
+        "Unhandled exception while processing update %r",
+        update,
+        exc_info=context.error,
+    )
 
 
 async def post_shutdown(application: Application) -> None:
-    del application
-    for project in list(PROJECTS.values()):
-        project.cancelled = True
-        project.cleanup()
-    PROJECTS.clear()
-    logger.info("KhmerDubAI V10 shutdown complete.")
+    pending: list[asyncio.Task] = []
+    for session in sessions.values():
+        for task in (session.expiry_task, session.processing_task):
+            if task and not task.done():
+                task.cancel()
+                pending.append(task)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    if gemini_client is not None:
+        try:
+            gemini_client.close()
+        except Exception:
+            logger.debug("Gemini client close ignored", exc_info=True)
 
 
 def main() -> None:
+    validate_runtime()
+    initialize_clients()
+
     application = (
         ApplicationBuilder()
         .token(TELEGRAM_BOT_TOKEN)
-        .concurrent_updates(True)
-        .connect_timeout(60)
+        .concurrent_updates(UPDATE_CONCURRENCY)
         .read_timeout(300)
         .write_timeout(300)
+        .connect_timeout(60)
         .pool_timeout(60)
-        .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
     )
 
-    application.add_handler(CommandHandler("start", start_handler))
-    application.add_handler(CommandHandler("help", help_handler))
-    application.add_handler(CommandHandler("cancel", cancel_handler))
-    application.add_handler(CallbackQueryHandler(callback_handler, pattern=r"^v10:"))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("voice", voice_command))
     application.add_handler(
         MessageHandler(
-            filters.VIDEO
-            | filters.AUDIO
-            | filters.VOICE
-            | filters.Document.ALL,
-            upload_handler,
+            filters.Regex(f"^{re.escape(NEW_PROJECT_BUTTON)}$"),
+            new_project,
         )
     )
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.AUDIO, handle_audio))
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    application.add_handler(MessageHandler(filters.VIDEO, handle_video))
     application.add_error_handler(error_handler)
 
-    logger.info("Starting KhmerDubAI V10 polling...")
+    logger.info(
+        "KhmerDubAI | max=%ss | idle=%ss | whisper=%s | "
+        "tts_parallel=%s | update_parallel=%s",
+        MAX_MEDIA_SECONDS,
+        SESSION_IDLE_SECONDS,
+        WHISPER_MODEL,
+        TTS_CONCURRENCY,
+        UPDATE_CONCURRENCY,
+    )
     application.run_polling(
+        drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=False,
     )
 
 
