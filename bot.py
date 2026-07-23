@@ -49,9 +49,16 @@ DELETE_OUTPUT_MESSAGES = os.getenv("DELETE_OUTPUT_MESSAGES", "true").lower() == 
 MAX_MEDIA_SECONDS = int(os.getenv("MAX_MEDIA_SECONDS", "300"))
 SESSION_IDLE_SECONDS = int(os.getenv("SESSION_IDLE_SECONDS", "600"))
 NEW_PROJECT_BUTTON = "🆕 ធ្វើថ្មី"
+UPLOAD_BUTTON = "📤 Upload Video / Audio"
+CLOSE_PROJECT_BUTTON = "🗑️ បិទ Project"
+HELP_BUTTON = "ℹ️ របៀបប្រើ"
 
-NEW_PROJECT_KEYBOARD = ReplyKeyboardMarkup(
-    [[NEW_PROJECT_BUTTON]],
+PROJECT_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [NEW_PROJECT_BUTTON],
+        [UPLOAD_BUTTON, CLOSE_PROJECT_BUTTON],
+        [HELP_BUTTON],
+    ],
     resize_keyboard=True,
     is_persistent=True,
 )
@@ -179,7 +186,7 @@ async def expire_after_inactivity(
                 "⌛ គម្រោងផុតកំណត់ ព្រោះគ្មានសកម្មភាព 10 នាទី។\n\n"
                 "ចុច «🆕 ធ្វើថ្មី» មុនពេលផ្ញើឯកសារថ្មី។"
             ),
-            reply_markup=NEW_PROJECT_KEYBOARD,
+            reply_markup=PROJECT_KEYBOARD,
         )
         track_message(notice)
         return
@@ -212,7 +219,7 @@ async def require_new_project_started(
         prompt = await update.message.reply_text(
             "សូមចុច «🆕 ធ្វើថ្មី» ជាមុនសិន "
             "ទើបអាចផ្ញើវីដេអូ ឬសំឡេងបាន។",
-            reply_markup=NEW_PROJECT_KEYBOARD,
+            reply_markup=PROJECT_KEYBOARD,
         )
         track_message(prompt)
         return False
@@ -254,10 +261,11 @@ async def new_project(
     session["message_ids"] = {update.message.message_id}
 
     ready = await update.message.reply_text(
-        "✅ បានលុបគម្រោងចាស់ និងបង្កើតគម្រោងថ្មីរួចរាល់។\n\n"
-        "ឥឡូវអាចផ្ញើវីដេអូ ឬសំឡេងរឿងចិនបាន។\n"
-        "⏱ រយៈពេលត្រូវត្រឹម 5 នាទី ឬតិចជាងនេះ។",
-        reply_markup=NEW_PROJECT_KEYBOARD,
+        "✅ Project ថ្មីរួចរាល់។\n\n"
+        "📤 ឥឡូវផ្ញើវីដេអូ ឬសំឡេងរឿងចិនបាន។\n"
+        "⏱ រយៈពេលត្រូវត្រឹម 5 នាទី ឬតិចជាងនេះ។\n"
+        "📦 Bot នឹងផ្ញើតែ Khmer SRT និង Khmer MP3។",
+        reply_markup=PROJECT_KEYBOARD,
     )
     track_message(ready)
     touch_session(context, chat_id)
@@ -858,24 +866,105 @@ async def process_media(
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    session = get_session(update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    session = get_session(chat_id)
+
+    expiry_task = session.get("expiry_task")
+    if expiry_task and not expiry_task.done():
+        expiry_task.cancel()
+
     session["active"] = False
+    session["processing_task"] = None
+    session["last_activity"] = time.monotonic()
 
     message = await update.message.reply_text(
-        "សួស្តី! ខ្ញុំគឺ KhmerDubAI Turbo 🤖\n\n"
-        "មុនផ្ញើឯកសារ សូមចុច «🆕 ធ្វើថ្មី»។\n"
-        "ប៊ូតុងនេះនឹងលុបគម្រោងចាស់ "
-        "ហើយបង្កើតគម្រោងថ្មី។\n\n"
-        "⏱ ទទួលវីដេអូ ឬសំឡេងរហូតដល់ 5 នាទី។\n"
-        "⌛ បើគ្មានសកម្មភាព 10 នាទី "
-        "គម្រោងនឹងផុតកំណត់ ហើយត្រូវចុចប៊ូតុងម្ដងទៀត។",
-        reply_markup=NEW_PROJECT_KEYBOARD,
+        "🤖 KhmerDubAI Project Manager\n\n"
+        "មុនចាប់ផ្ដើម សូមចុច «🆕 ធ្វើថ្មី»។\n"
+        "បន្ទាប់មកផ្ញើវីដេអូ ឬសំឡេងរឿងចិន។\n\n"
+        "⏱ កំណត់វីដេអូ/សំឡេង៖ 5 នាទី ឬតិចជាងនេះ\n"
+        "📦 លទ្ធផល៖ khmer_dub.srt និង khmer_dub.mp3\n"
+        "⌛ គ្មានសកម្មភាព 10 នាទី Project នឹងផុតកំណត់។",
+        reply_markup=PROJECT_KEYBOARD,
     )
     track_message(message)
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await start(update, context)
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = await update.message.reply_text(
+        "ℹ️ របៀបប្រើ KhmerDubAI\n\n"
+        "1. ចុច «🆕 ធ្វើថ្មី»\n"
+        "2. ផ្ញើវីដេអូ ឬសំឡេង 5 នាទី ឬតិចជាងនេះ\n"
+        "3. មើល Progress 0%–100%\n"
+        "4. ទទួល khmer_dub.srt និង khmer_dub.mp3\n"
+        "5. ចុច «🗑️ បិទ Project» ពេលចប់\n\n"
+        "ប៊ូតុង «🆕 ធ្វើថ្មី» នឹងបញ្ឈប់ការងារចាស់ "
+        "និងសម្អាតសារគម្រោងចាស់ដែល Bot អាចលុបបាន។",
+        reply_markup=PROJECT_KEYBOARD,
+    )
+    track_message(message)
+
+
+async def upload_prompt(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    session = get_session(update.effective_chat.id)
+
+    if not session["active"]:
+        message = await update.message.reply_text(
+            "សូមចុច «🆕 ធ្វើថ្មី» ជាមុនសិន។",
+            reply_markup=PROJECT_KEYBOARD,
+        )
+    else:
+        message = await update.message.reply_text(
+            "📤 ឥឡូវផ្ញើវីដេអូ ឬសំឡេងរឿងចិនបាន។\n"
+            "⏱ ត្រូវមានរយៈពេល 5 នាទី ឬតិចជាងនេះ។",
+            reply_markup=PROJECT_KEYBOARD,
+        )
+
+    track_message(message)
+
+
+async def close_project(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    chat_id = update.effective_chat.id
+    session = get_session(chat_id)
+
+    running_task = session.get("processing_task")
+    if (
+        running_task
+        and not running_task.done()
+        and running_task is not asyncio.current_task()
+    ):
+        running_task.cancel()
+
+    expiry_task = session.get("expiry_task")
+    if expiry_task and not expiry_task.done():
+        expiry_task.cancel()
+
+    await clear_previous_project(
+        context.bot,
+        chat_id,
+        keep_message_id=update.message.message_id,
+    )
+
+    session["generation"] += 1
+    session["active"] = False
+    session["processing_task"] = None
+    session["last_activity"] = time.monotonic()
+    session["message_ids"] = {update.message.message_id}
+
+    message = await update.message.reply_text(
+        "🗑️ Project ត្រូវបានបិទ និងសម្អាតរួចរាល់។\n\n"
+        "ចុច «🆕 ធ្វើថ្មី» ដើម្បីចាប់ផ្ដើមម្ដងទៀត។",
+        reply_markup=PROJECT_KEYBOARD,
+    )
+    track_message(message)
 
 
 async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1167,6 +1256,24 @@ def main() -> None:
         MessageHandler(
             filters.Regex(f"^{re.escape(NEW_PROJECT_BUTTON)}$"),
             new_project,
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.Regex(f"^{re.escape(UPLOAD_BUTTON)}$"),
+            upload_prompt,
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.Regex(f"^{re.escape(CLOSE_PROJECT_BUTTON)}$"),
+            close_project,
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.Regex(f"^{re.escape(HELP_BUTTON)}$"),
+            help_command,
         )
     )
     application.add_handler(
