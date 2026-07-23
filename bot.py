@@ -359,7 +359,7 @@ def clean_gemini_output(text: str) -> str:
 
 def translation_prompt() -> str:
     return """
-You are KhmerDubAI V8, an Expert Khmer Movie Subtitler,
+You are KhmerDubAI V9 Speaker Lock, an Expert Khmer Movie Subtitler,
 Character Continuity Editor, and Emotional Dubbing Translator.
 
 TASK:
@@ -384,10 +384,12 @@ KHMER LANGUAGE:
 CHARACTER CONTINUITY:
 1. Read the whole SRT as one continuous scene.
 2. Keep the same voice tag for the same speaker across nearby subtitle blocks.
-3. Do not randomly switch male/female, young/adult/old, or narrator tags.
+3. Never randomly swap male and female voices. Male characters must remain male and female characters must remain female throughout the same scene.
 4. Infer speaker identity from names, titles, pronouns, previous lines,
    replies, and scene continuity.
 5. Distinguish spoken dialogue from inner thought and narration.
+6. Short replies must inherit the speaker from nearby scene context instead of being guessed independently.
+7. Change speaker gender only when there is clear evidence that another character has started speaking.
 
 STATUS AND PRONOUNS:
 Choose Khmer pronouns and titles according to age, rank, relationship,
@@ -605,6 +607,86 @@ def parse_tagged_srt(srt_text: str) -> list[SubtitleCue]:
     return sorted(cues, key=lambda cue: (cue.start, cue.index))
 
 
+
+MALE_TAGS = {"M_YOUNG", "M_ADULT", "M_OLD", "BOY", "M_THINK", "NARRATOR_M"}
+FEMALE_TAGS = {"F_YOUNG", "F_ADULT", "F_OLD", "GIRL", "F_THINK", "NARRATOR_F"}
+PROTECTED_SPEAKER_TAGS = {
+    "BOY", "GIRL", "M_OLD", "F_OLD",
+    "M_THINK", "F_THINK", "NARRATOR_M", "NARRATOR_F",
+}
+
+
+def speaker_gender(tag: str) -> str:
+    if tag in MALE_TAGS:
+        return "male"
+    if tag in FEMALE_TAGS:
+        return "female"
+    return "unknown"
+
+
+def stabilize_speaker_tags(cues: list[SubtitleCue]) -> list[SubtitleCue]:
+    """Repair only short, isolated male/female swaps inside a continuous scene."""
+    if len(cues) < 3:
+        return cues
+
+    stable = [
+        SubtitleCue(
+            index=cue.index,
+            start=cue.start,
+            end=cue.end,
+            tag=cue.tag,
+            emotion=cue.emotion,
+            text=cue.text,
+        )
+        for cue in cues
+    ]
+
+    for i in range(1, len(stable) - 1):
+        previous = stable[i - 1]
+        current = stable[i]
+        following = stable[i + 1]
+
+        if (
+            current.start - previous.end <= 1.0
+            and following.start - current.end <= 1.0
+            and previous.tag == following.tag
+            and speaker_gender(previous.tag) != "unknown"
+            and speaker_gender(current.tag) != "unknown"
+            and speaker_gender(previous.tag) != speaker_gender(current.tag)
+            and len(current.text.strip()) <= 32
+            and current.tag not in PROTECTED_SPEAKER_TAGS
+            and previous.tag not in PROTECTED_SPEAKER_TAGS
+        ):
+            logger.info(
+                "Speaker lock corrected cue %s from %s to %s",
+                current.index,
+                current.tag,
+                previous.tag,
+            )
+            current.tag = previous.tag
+
+    return stable
+
+
+def validate_voice_mapping(cues: list[SubtitleCue]) -> None:
+    for cue in cues:
+        profile = VOICE_PROFILES.get(cue.tag)
+        if profile is None:
+            raise RuntimeError(
+                f"Unknown voice tag at subtitle {cue.index}: {cue.tag}"
+            )
+
+        voice = profile["voice"]
+        if cue.tag in MALE_TAGS and voice != MALE_VOICE:
+            raise RuntimeError(
+                f"Male subtitle {cue.index} was mapped to the wrong voice."
+            )
+        if cue.tag in FEMALE_TAGS and voice != FEMALE_VOICE:
+            raise RuntimeError(
+                f"Female subtitle {cue.index} was mapped to the wrong voice."
+            )
+
+
 def parse_signed_number(value: str) -> int:
     match = re.search(r"[-+]?\d+", value)
     return int(match.group()) if match else 0
@@ -726,6 +808,11 @@ async def prepare_cue_audio(
     desired_speed = raw_duration / target_duration
     safe_speed = max(MIN_SPEED, min(MAX_SPEED, desired_speed))
 
+    # Preserve the ending words; do not hard-cut speech at the subtitle boundary.
+    spoken_duration = raw_duration / safe_speed
+    canvas_duration = max(target_duration, spoken_duration + 0.06)
+    fade_out_start = max(0.0, spoken_duration - 0.05)
+
     await asyncio.to_thread(
         run_ffmpeg,
         [
@@ -735,9 +822,9 @@ async def prepare_cue_audio(
                 f"atempo={safe_speed:.6f},"
                 "highpass=f=70,lowpass=f=12500,"
                 "afade=t=in:st=0:d=0.025,"
-                f"afade=t=out:st={max(0.0, target_duration - 0.035):.3f}:d=0.035,"
-                f"apad=pad_dur={target_duration:.3f},"
-                f"atrim=0:{target_duration:.3f},"
+                f"afade=t=out:st={fade_out_start:.3f}:d=0.05,"
+                f"apad=pad_dur={canvas_duration:.3f},"
+                f"atrim=0:{canvas_duration:.3f},"
                 "aresample=48000"
             ),
             "-ac", "2",
@@ -791,14 +878,33 @@ async def create_timed_dub_mp3(
 
     filter_parts = []
     labels = []
-    for index, (_file_path, delay_ms) in enumerate(prepared):
+    previous_end_ms = 0
+    adjusted_end_seconds = 0.0
+
+    for index, (file_path, requested_delay_ms) in enumerate(prepared):
+        audio_duration_ms = int(
+            round(await asyncio.to_thread(ffprobe_duration, file_path) * 1000)
+        )
+        delay_ms = max(
+            requested_delay_ms,
+            previous_end_ms + (35 if index else 0),
+        )
+        previous_end_ms = delay_ms + audio_duration_ms
+        adjusted_end_seconds = max(
+            adjusted_end_seconds,
+            previous_end_ms / 1000.0,
+        )
+
         label = f"a{index}"
         filter_parts.append(
             f"[{index}:a]adelay={delay_ms}:all=1,volume=1[{label}]"
         )
         labels.append(f"[{label}]")
 
-    total_duration = max(cue.end for cue in cues) + 0.30
+    total_duration = max(
+        max(cue.end for cue in cues) + 0.30,
+        adjusted_end_seconds + 0.10,
+    )
     filter_parts.append(
         f"{''.join(labels)}amix=inputs={len(labels)}:"
         f"duration=longest:dropout_transition=0.08,"
@@ -854,6 +960,8 @@ async def process_srt_upload(
         km_path = tmpdir / "khmer_dub.srt"
         km_path.write_text(khmer_srt, encoding="utf-8")
         cues = parse_tagged_srt(khmer_srt)
+        cues = stabilize_speaker_tags(cues)
+        validate_voice_mapping(cues)
 
         await progress(40, f"បកប្រែរួច {len(cues)} ឃ្លា")
         mp3_path = tmpdir / "khmer_dub.mp3"
@@ -940,6 +1048,8 @@ async def process_media(
         km_path = tmpdir / "khmer_dub.srt"
         km_path.write_text(khmer_srt, encoding="utf-8")
         cues = parse_tagged_srt(khmer_srt)
+        cues = stabilize_speaker_tags(cues)
+        validate_voice_mapping(cues)
 
         await progress(42, f"បកប្រែរួច {len(cues)} ឃ្លា")
         mp3_path = tmpdir / "khmer_dub.mp3"
