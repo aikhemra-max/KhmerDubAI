@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
@@ -11,7 +12,7 @@ from typing import Awaitable, Callable, Optional
 import edge_tts
 from faster_whisper import WhisperModel
 from google import genai
-from telegram import Message, Update
+from telegram import Message, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
@@ -43,6 +44,19 @@ FEMALE_VOICE = os.getenv("FEMALE_VOICE", "km-KH-SreymomNeural")
 AUTO_DELETE_MINUTES = int(os.getenv("AUTO_DELETE_MINUTES", "5"))
 DELETE_USER_UPLOAD = os.getenv("DELETE_USER_UPLOAD", "true").lower() == "true"
 DELETE_OUTPUT_MESSAGES = os.getenv("DELETE_OUTPUT_MESSAGES", "true").lower() == "true"
+
+
+MAX_MEDIA_SECONDS = int(os.getenv("MAX_MEDIA_SECONDS", "300"))
+SESSION_IDLE_SECONDS = int(os.getenv("SESSION_IDLE_SECONDS", "600"))
+NEW_PROJECT_BUTTON = "🆕 ធ្វើថ្មី"
+
+NEW_PROJECT_KEYBOARD = ReplyKeyboardMarkup(
+    [[NEW_PROJECT_BUTTON]],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+sessions: dict[int, dict] = {}
 
 MAX_TTS_RETRIES = int(os.getenv("MAX_TTS_RETRIES", "3"))
 TTS_CONCURRENCY = int(os.getenv("TTS_CONCURRENCY", "4"))
@@ -95,6 +109,167 @@ EMOTION_ADJUSTMENTS = {
 }
 VALID_EMOTIONS = set(EMOTION_ADJUSTMENTS)
 
+
+
+def get_session(chat_id: int) -> dict:
+    session = sessions.get(chat_id)
+    if session is None:
+        session = {
+            "active": False,
+            "generation": 0,
+            "last_activity": 0.0,
+            "message_ids": set(),
+            "expiry_task": None,
+            "processing_task": None,
+        }
+        sessions[chat_id] = session
+    return session
+
+
+def track_message(message: Optional[Message]) -> None:
+    if message is not None:
+        get_session(message.chat_id)["message_ids"].add(message.message_id)
+
+
+async def safe_delete_message(bot, chat_id: int, message_id: int) -> None:
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as exc:
+        logger.debug("Delete ignored: %s", exc)
+
+
+async def clear_previous_project(
+    bot,
+    chat_id: int,
+    keep_message_id: Optional[int] = None,
+) -> None:
+    session = get_session(chat_id)
+    old_ids = list(session["message_ids"])
+    session["message_ids"].clear()
+
+    for message_id in old_ids:
+        if keep_message_id is not None and message_id == keep_message_id:
+            continue
+        await safe_delete_message(bot, chat_id, message_id)
+
+
+async def expire_after_inactivity(
+    bot,
+    chat_id: int,
+    generation: int,
+) -> None:
+    while True:
+        session = get_session(chat_id)
+        if session["generation"] != generation:
+            return
+
+        remaining = SESSION_IDLE_SECONDS - (
+            time.monotonic() - session["last_activity"]
+        )
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+            continue
+
+        session["active"] = False
+        session["processing_task"] = None
+
+        notice = await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⌛ គម្រោងផុតកំណត់ ព្រោះគ្មានសកម្មភាព 10 នាទី។\n\n"
+                "ចុច «🆕 ធ្វើថ្មី» មុនពេលផ្ញើឯកសារថ្មី។"
+            ),
+            reply_markup=NEW_PROJECT_KEYBOARD,
+        )
+        track_message(notice)
+        return
+
+
+def touch_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    session = get_session(chat_id)
+    session["last_activity"] = time.monotonic()
+
+    old_task = session.get("expiry_task")
+    if old_task and not old_task.done():
+        old_task.cancel()
+
+    session["expiry_task"] = asyncio.create_task(
+        expire_after_inactivity(
+            context.bot,
+            chat_id,
+            session["generation"],
+        )
+    )
+
+
+async def require_new_project_started(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    session = get_session(update.effective_chat.id)
+
+    if not session["active"]:
+        prompt = await update.message.reply_text(
+            "សូមចុច «🆕 ធ្វើថ្មី» ជាមុនសិន "
+            "ទើបអាចផ្ញើវីដេអូ ឬសំឡេងបាន។",
+            reply_markup=NEW_PROJECT_KEYBOARD,
+        )
+        track_message(prompt)
+        return False
+
+    track_message(update.message)
+    touch_session(context, update.effective_chat.id)
+    return True
+
+
+async def new_project(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    chat_id = update.effective_chat.id
+    session = get_session(chat_id)
+
+    running_task = session.get("processing_task")
+    if (
+        running_task
+        and not running_task.done()
+        and running_task is not asyncio.current_task()
+    ):
+        running_task.cancel()
+
+    expiry_task = session.get("expiry_task")
+    if expiry_task and not expiry_task.done():
+        expiry_task.cancel()
+
+    await clear_previous_project(
+        context.bot,
+        chat_id,
+        keep_message_id=update.message.message_id,
+    )
+
+    session["generation"] += 1
+    session["active"] = True
+    session["last_activity"] = time.monotonic()
+    session["processing_task"] = None
+    session["message_ids"] = {update.message.message_id}
+
+    ready = await update.message.reply_text(
+        "✅ បានលុបគម្រោងចាស់ និងបង្កើតគម្រោងថ្មីរួចរាល់។\n\n"
+        "ឥឡូវអាចផ្ញើវីដេអូ ឬសំឡេងរឿងចិនបាន។\n"
+        "⏱ រយៈពេលត្រូវត្រឹម 5 នាទី ឬតិចជាងនេះ។",
+        reply_markup=NEW_PROJECT_KEYBOARD,
+    )
+    track_message(ready)
+    touch_session(context, chat_id)
+
+
+def validate_media_duration(media_path: Path) -> None:
+    duration = ffprobe_duration(media_path)
+    if duration > MAX_MEDIA_SECONDS + 0.5:
+        raise ValueError(
+            "វីដេអូ ឬសំឡេងវែងជាង 5 នាទី។ "
+            "សូមកាត់ឱ្យនៅត្រឹម 5 នាទី ឬតិចជាងនេះ។"
+        )
 
 def get_whisper_model():
     global _whisper_model
@@ -532,9 +707,11 @@ async def process_srt_upload(
     tmpdir: Path,
 ) -> None:
     status = await update.message.reply_text("⏳ កំពុងចាប់ផ្ដើម… 0%")
+    track_message(status)
     state = {"last_percent": -10}
 
     async def progress(percent: int, label: str) -> None:
+        get_session(update.effective_chat.id)["last_activity"] = time.monotonic()
         await update_progress(status, percent, label, state)
 
     try:
@@ -586,6 +763,8 @@ async def process_srt_upload(
             )
 
         await progress(100, "ការងាររួចរាល់ ✅")
+        track_message(srt_message)
+        track_message(mp3_message)
         schedule_delete(status)
         schedule_delete(srt_message, DELETE_OUTPUT_MESSAGES)
         schedule_delete(mp3_message, DELETE_OUTPUT_MESSAGES)
@@ -601,9 +780,11 @@ async def process_media(
     tmpdir: Path,
 ) -> None:
     status = await update.message.reply_text("⏳ កំពុងចាប់ផ្ដើម… 0%")
+    track_message(status)
     state = {"last_percent": -10}
 
     async def progress(percent: int, label: str) -> None:
+        get_session(update.effective_chat.id)["last_activity"] = time.monotonic()
         await update_progress(status, percent, label, state)
 
     try:
@@ -665,6 +846,8 @@ async def process_media(
             )
 
         await progress(100, "បកប្រែ និងបង្កើតសំឡេងរួចរាល់ ✅")
+        track_message(srt_message)
+        track_message(mp3_message)
         schedule_delete(status)
         schedule_delete(srt_message, DELETE_OUTPUT_MESSAGES)
         schedule_delete(mp3_message, DELETE_OUTPUT_MESSAGES)
@@ -675,17 +858,20 @@ async def process_media(
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    session = get_session(update.effective_chat.id)
+    session["active"] = False
+
     message = await update.message.reply_text(
         "សួស្តី! ខ្ញុំគឺ KhmerDubAI Turbo 🤖\n\n"
-        "ផ្ញើ MP3/M4A/WAV/SRT ឬវីដេអូរឿងចិន។\n"
-        "Bot នឹងបង្ហាញសកម្មភាពជាភាគរយ 0%–100% និងផ្ញើតែ៖\n"
-        "① khmer_dub.srt\n"
-        "② khmer_dub.mp3\n\n"
-        f"🗑 សារនិងឯកសារលទ្ធផលនឹងលុបក្រោយ "
-        f"{AUTO_DELETE_MINUTES} នាទី។\n"
-        "⚠️ Bot មិនអាចដឹងថាអ្នកបានបើក Telegram ឬអត់ទេ។"
+        "មុនផ្ញើឯកសារ សូមចុច «🆕 ធ្វើថ្មី»។\n"
+        "ប៊ូតុងនេះនឹងលុបគម្រោងចាស់ "
+        "ហើយបង្កើតគម្រោងថ្មី។\n\n"
+        "⏱ ទទួលវីដេអូ ឬសំឡេងរហូតដល់ 5 នាទី។\n"
+        "⌛ បើគ្មានសកម្មភាព 10 នាទី "
+        "គម្រោងនឹងផុតកំណត់ ហើយត្រូវចុចប៊ូតុងម្ដងទៀត។",
+        reply_markup=NEW_PROJECT_KEYBOARD,
     )
-    schedule_delete(message)
+    track_message(message)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -733,12 +919,15 @@ async def handle_document(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
+    if not await require_new_project_started(update, context):
+        return
+
+    session = get_session(update.effective_chat.id)
+    session["processing_task"] = asyncio.current_task()
+
     document = update.message.document
     if not document:
         return
-
-    if DELETE_USER_UPLOAD:
-        schedule_delete(update.message)
 
     filename = document.file_name or "file"
     suffix = Path(filename).suffix.lower()
@@ -747,12 +936,13 @@ async def handle_document(
         message = await update.message.reply_text(
             f"ឯកសារធំពេក។ កំណត់បច្ចុប្បន្ន៖ {MAX_FILE_MB} MB"
         )
-        schedule_delete(message)
+        track_message(message)
         return
 
     with tempfile.TemporaryDirectory(prefix="khmerdubai_") as tmp:
         tmpdir = Path(tmp)
         source_path = tmpdir / filename
+
         telegram_file = await document.get_file()
         await telegram_file.download_to_drive(custom_path=source_path)
 
@@ -763,36 +953,61 @@ async def handle_document(
                 ".mp3", ".wav", ".m4a", ".ogg", ".aac",
                 ".mp4", ".mov", ".mkv", ".avi",
             }:
+                await asyncio.to_thread(
+                    validate_media_duration,
+                    source_path,
+                )
                 await process_media(update, source_path, tmpdir)
             else:
                 message = await update.message.reply_text(
                     "សូមផ្ញើ SRT, MP3, M4A, WAV, Audio ឬ Video។"
                 )
-                schedule_delete(message)
+                track_message(message)
+        except asyncio.CancelledError:
+            message = await update.message.reply_text(
+                "🛑 ការងារចាស់ត្រូវបានបញ្ឈប់។ "
+                "អ្នកអាចចាប់ផ្ដើមគម្រោងថ្មីបាន។"
+            )
+            track_message(message)
+            raise
         except Exception as exc:
             logger.exception("Document processing failed")
             message = await update.message.reply_text(
                 f"មានបញ្ហាពេលដំណើរការ៖ {exc}"
             )
-            schedule_delete(message)
+            track_message(message)
+        finally:
+            session["processing_task"] = None
 
 
 async def handle_audio(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
+    if not await require_new_project_started(update, context):
+        return
+
+    session = get_session(update.effective_chat.id)
+    session["processing_task"] = asyncio.current_task()
+
     media = update.message.audio
     if not media:
         return
 
-    if DELETE_USER_UPLOAD:
-        schedule_delete(update.message)
+    if media.duration and media.duration > MAX_MEDIA_SECONDS:
+        message = await update.message.reply_text(
+            "សំឡេងវែងជាង 5 នាទី។ សូមកាត់ឱ្យខ្លីជាងនេះ។"
+        )
+        track_message(message)
+        session["processing_task"] = None
+        return
 
     if media.file_size and media.file_size > MAX_FILE_MB * 1024 * 1024:
         message = await update.message.reply_text(
             f"ឯកសារធំពេក។ កំណត់បច្ចុប្បន្ន៖ {MAX_FILE_MB} MB"
         )
-        schedule_delete(message)
+        track_message(message)
+        session["processing_task"] = None
         return
 
     suffix = Path(media.file_name or "audio.mp3").suffix.lower() or ".mp3"
@@ -800,78 +1015,132 @@ async def handle_audio(
     with tempfile.TemporaryDirectory(prefix="khmerdubai_") as tmp:
         tmpdir = Path(tmp)
         source_path = tmpdir / f"audio{suffix}"
+
         telegram_file = await media.get_file()
         await telegram_file.download_to_drive(custom_path=source_path)
 
         try:
+            await asyncio.to_thread(validate_media_duration, source_path)
             await process_media(update, source_path, tmpdir)
+        except asyncio.CancelledError:
+            message = await update.message.reply_text(
+                "🛑 ការងារចាស់ត្រូវបានបញ្ឈប់។"
+            )
+            track_message(message)
+            raise
         except Exception as exc:
             logger.exception("Audio processing failed")
             message = await update.message.reply_text(
                 f"មានបញ្ហាពេលដំណើរការសំឡេង៖ {exc}"
             )
-            schedule_delete(message)
+            track_message(message)
+        finally:
+            session["processing_task"] = None
 
 
 async def handle_voice(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
+    if not await require_new_project_started(update, context):
+        return
+
+    session = get_session(update.effective_chat.id)
+    session["processing_task"] = asyncio.current_task()
+
     voice = update.message.voice
     if not voice:
         return
 
-    if DELETE_USER_UPLOAD:
-        schedule_delete(update.message)
+    if voice.duration and voice.duration > MAX_MEDIA_SECONDS:
+        message = await update.message.reply_text(
+            "សំឡេងវែងជាង 5 នាទី។ សូមកាត់ឱ្យខ្លីជាងនេះ។"
+        )
+        track_message(message)
+        session["processing_task"] = None
+        return
 
     with tempfile.TemporaryDirectory(prefix="khmerdubai_") as tmp:
         tmpdir = Path(tmp)
         source_path = tmpdir / "voice.ogg"
+
         telegram_file = await voice.get_file()
         await telegram_file.download_to_drive(custom_path=source_path)
 
         try:
+            await asyncio.to_thread(validate_media_duration, source_path)
             await process_media(update, source_path, tmpdir)
+        except asyncio.CancelledError:
+            message = await update.message.reply_text(
+                "🛑 ការងារចាស់ត្រូវបានបញ្ឈប់។"
+            )
+            track_message(message)
+            raise
         except Exception as exc:
             logger.exception("Voice processing failed")
             message = await update.message.reply_text(
                 f"មានបញ្ហាពេលដំណើរការសំឡេង៖ {exc}"
             )
-            schedule_delete(message)
+            track_message(message)
+        finally:
+            session["processing_task"] = None
 
 
 async def handle_video(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
+    if not await require_new_project_started(update, context):
+        return
+
+    session = get_session(update.effective_chat.id)
+    session["processing_task"] = asyncio.current_task()
+
     video = update.message.video
     if not video:
         return
 
-    if DELETE_USER_UPLOAD:
-        schedule_delete(update.message)
+    if video.duration and video.duration > MAX_MEDIA_SECONDS:
+        message = await update.message.reply_text(
+            "វីដេអូវែងជាង 5 នាទី។ "
+            "សូមកាត់ឱ្យនៅត្រឹម 5 នាទី ឬតិចជាងនេះ។"
+        )
+        track_message(message)
+        session["processing_task"] = None
+        return
 
     if video.file_size and video.file_size > MAX_FILE_MB * 1024 * 1024:
         message = await update.message.reply_text(
             f"វីដេអូធំពេក។ កំណត់បច្ចុប្បន្ន៖ {MAX_FILE_MB} MB"
         )
-        schedule_delete(message)
+        track_message(message)
+        session["processing_task"] = None
         return
 
     with tempfile.TemporaryDirectory(prefix="khmerdubai_") as tmp:
         tmpdir = Path(tmp)
         source_path = tmpdir / "video.mp4"
+
         telegram_file = await video.get_file()
         await telegram_file.download_to_drive(custom_path=source_path)
 
         try:
+            await asyncio.to_thread(validate_media_duration, source_path)
             await process_media(update, source_path, tmpdir)
+        except asyncio.CancelledError:
+            message = await update.message.reply_text(
+                "🛑 ការងារចាស់ត្រូវបានបញ្ឈប់។"
+            )
+            track_message(message)
+            raise
         except Exception as exc:
             logger.exception("Video processing failed")
             message = await update.message.reply_text(
                 f"មានបញ្ហាពេលដំណើរការ៖ {exc}"
             )
-            schedule_delete(message)
+            track_message(message)
+        finally:
+            session["processing_task"] = None
 
 
 async def error_handler(
@@ -895,6 +1164,12 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("voice", voice_command))
     application.add_handler(
+        MessageHandler(
+            filters.Regex(f"^{re.escape(NEW_PROJECT_BUTTON)}$"),
+            new_project,
+        )
+    )
+    application.add_handler(
         MessageHandler(filters.Document.ALL, handle_document)
     )
     application.add_handler(MessageHandler(filters.AUDIO, handle_audio))
@@ -903,8 +1178,9 @@ def main() -> None:
     application.add_error_handler(error_handler)
 
     logger.info(
-        "KhmerDubAI Turbo running | delete=%s min | whisper=%s | tts_parallel=%s",
-        AUTO_DELETE_MINUTES,
+        "KhmerDubAI New Project | max=%ss | idle=%ss | whisper=%s | parallel=%s",
+        MAX_MEDIA_SECONDS,
+        SESSION_IDLE_SECONDS,
         WHISPER_MODEL,
         TTS_CONCURRENCY,
     )
