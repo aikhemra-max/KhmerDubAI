@@ -39,12 +39,9 @@ MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "45"))
 MALE_VOICE = os.getenv("MALE_VOICE", "km-KH-PisethNeural")
 FEMALE_VOICE = os.getenv("FEMALE_VOICE", "km-KH-SreymomNeural")
 
-# លុបសារ/ឯកសារនៅ Telegram ក្រោយពេលកំណត់។
-# Bot មិនអាចដឹងថាអ្នកប្រើបានបើក Telegram ឬអត់ទេ។
 AUTO_DELETE_MINUTES = int(os.getenv("AUTO_DELETE_MINUTES", "5"))
 DELETE_USER_UPLOAD = os.getenv("DELETE_USER_UPLOAD", "true").lower() == "true"
 DELETE_OUTPUT_MESSAGES = os.getenv("DELETE_OUTPUT_MESSAGES", "true").lower() == "true"
-
 
 MAX_MEDIA_SECONDS = int(os.getenv("MAX_MEDIA_SECONDS", "300"))
 SESSION_IDLE_SECONDS = int(os.getenv("SESSION_IDLE_SECONDS", "600"))
@@ -63,7 +60,7 @@ TTS_TIMEOUT_SECONDS = int(os.getenv("TTS_TIMEOUT_SECONDS", "90"))
 GEMINI_TIMEOUT_SECONDS = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "180"))
 TRANSLATION_RETRIES = int(os.getenv("TRANSLATION_RETRIES", "2"))
 TTS_CONCURRENCY = int(os.getenv("TTS_CONCURRENCY", "5"))
-MIN_SPEED = float(os.getenv("MIN_SPEED", "0.88"))
+MIN_SPEED = float(os.getenv("MIN_SPEED", "1.0")) # កែសម្រួល៖ មិនឱ្យទាបជាង 1.0 ដើម្បីកុំឱ្យសំឡេងយឺត ឬស្អក
 MAX_SPEED = float(os.getenv("MAX_SPEED", "1.15"))
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -111,7 +108,6 @@ EMOTION_ADJUSTMENTS = {
     "THINKING": {"rate": -6, "pitch": -3, "volume": -5},
 }
 VALID_EMOTIONS = set(EMOTION_ADJUSTMENTS)
-
 
 
 def get_session(chat_id: int) -> dict:
@@ -275,6 +271,7 @@ def validate_media_duration(media_path: Path) -> None:
             "សូមកាត់ឱ្យនៅត្រឹម 5 នាទី ឬតិចជាងនេះ។"
         )
 
+
 def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
@@ -300,7 +297,6 @@ async def update_progress(
     state: dict,
 ) -> None:
     percent = max(0, min(100, int(percent)))
-    # កុំ Edit ញឹកញាប់ពេក ដើម្បីជៀសវាង Telegram rate limit។
     if percent < 100 and percent - state.get("last_percent", -10) < 5:
         return
 
@@ -607,7 +603,6 @@ def parse_tagged_srt(srt_text: str) -> list[SubtitleCue]:
     return sorted(cues, key=lambda cue: (cue.start, cue.index))
 
 
-
 MALE_TAGS = {"M_YOUNG", "M_ADULT", "M_OLD", "BOY", "M_THINK", "NARRATOR_M"}
 FEMALE_TAGS = {"F_YOUNG", "F_ADULT", "F_OLD", "GIRL", "F_THINK", "NARRATOR_F"}
 PROTECTED_SPEAKER_TAGS = {
@@ -625,47 +620,11 @@ def speaker_gender(tag: str) -> str:
 
 
 def stabilize_speaker_tags(cues: list[SubtitleCue]) -> list[SubtitleCue]:
-    """Repair only short, isolated male/female swaps inside a continuous scene."""
-    if len(cues) < 3:
-        return cues
-
-    stable = [
-        SubtitleCue(
-            index=cue.index,
-            start=cue.start,
-            end=cue.end,
-            tag=cue.tag,
-            emotion=cue.emotion,
-            text=cue.text,
-        )
-        for cue in cues
-    ]
-
-    for i in range(1, len(stable) - 1):
-        previous = stable[i - 1]
-        current = stable[i]
-        following = stable[i + 1]
-
-        if (
-            current.start - previous.end <= 1.0
-            and following.start - current.end <= 1.0
-            and previous.tag == following.tag
-            and speaker_gender(previous.tag) != "unknown"
-            and speaker_gender(current.tag) != "unknown"
-            and speaker_gender(previous.tag) != speaker_gender(current.tag)
-            and len(current.text.strip()) <= 32
-            and current.tag not in PROTECTED_SPEAKER_TAGS
-            and previous.tag not in PROTECTED_SPEAKER_TAGS
-        ):
-            logger.info(
-                "Speaker lock corrected cue %s from %s to %s",
-                current.index,
-                current.tag,
-                previous.tag,
-            )
-            current.tag = previous.tag
-
-    return stable
+    """
+    កែលម្អ៖ លុបចោលការបង្ខំដូរ Tag (A-B-A) ព្រោះវាធ្វើឱ្យខូចការសន្ទនាឆ្លើយឆ្លងគ្នាខ្លីៗរវាងប្រុស-ស្រី
+    ដែលនាំឱ្យប្រព័ន្ធប្ដូរសំឡេងតួអង្គច្រឡំគ្នាទៅវិញទៅមក។ យើងទុកចិត្តលើការបែងចែកពី Gemini ផ្ទាល់។
+    """
+    return cues
 
 
 def validate_voice_mapping(cues: list[SubtitleCue]) -> None:
@@ -805,10 +764,15 @@ async def prepare_cue_audio(
 
     raw_duration = await asyncio.to_thread(ffprobe_duration, raw_path)
     target_duration = max(0.25, cue.end - cue.start)
-    desired_speed = raw_duration / target_duration
-    safe_speed = max(MIN_SPEED, min(MAX_SPEED, desired_speed))
 
-    # Preserve the ending words; do not hard-cut speech at the subtitle boundary.
+    # កែលម្អ៖ បង្កើនល្បឿនតែនៅពេលដែលសំឡេងនិយាយវែងជាងប្រវែង Subtitle ប៉ុណ្ណោះ
+    # មិនឱ្យមានការពង្រីកល្បឿនចុះក្រោមជាង 1.0 ឡើយ ដើម្បីជៀសវាងសំឡេងយឺតខុសធម្មជាតិ
+    if raw_duration > target_duration:
+        desired_speed = raw_duration / target_duration
+        safe_speed = min(MAX_SPEED, desired_speed)
+    else:
+        safe_speed = 1.0
+
     spoken_duration = raw_duration / safe_speed
     canvas_duration = max(target_duration, spoken_duration + 0.06)
     fade_out_start = max(0.0, spoken_duration - 0.05)
@@ -878,21 +842,18 @@ async def create_timed_dub_mp3(
 
     filter_parts = []
     labels = []
-    previous_end_ms = 0
     adjusted_end_seconds = 0.0
 
     for index, (file_path, requested_delay_ms) in enumerate(prepared):
         audio_duration_ms = int(
             round(await asyncio.to_thread(ffprobe_duration, file_path) * 1000)
         )
-        delay_ms = max(
-            requested_delay_ms,
-            previous_end_ms + (35 if index else 0),
-        )
-        previous_end_ms = delay_ms + audio_duration_ms
+        # កែលម្អ៖ ប្រើប្រាស់ពេលវេលាចាប់ផ្ដើមជាក់ស្ដែង (Timestamp) ដោយមិនរំកិលសន្សំពេល ដើម្បីកុំឱ្យសំឡេងយឺតជាងវីដេអូ
+        delay_ms = requested_delay_ms
+        current_end_ms = delay_ms + audio_duration_ms
         adjusted_end_seconds = max(
             adjusted_end_seconds,
-            previous_end_ms / 1000.0,
+            current_end_ms / 1000.0,
         )
 
         label = f"a{index}"
