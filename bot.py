@@ -49,16 +49,9 @@ DELETE_OUTPUT_MESSAGES = os.getenv("DELETE_OUTPUT_MESSAGES", "true").lower() == 
 MAX_MEDIA_SECONDS = int(os.getenv("MAX_MEDIA_SECONDS", "300"))
 SESSION_IDLE_SECONDS = int(os.getenv("SESSION_IDLE_SECONDS", "600"))
 NEW_PROJECT_BUTTON = "🆕 ធ្វើថ្មី"
-UPLOAD_BUTTON = "📤 Upload Video / Audio"
-CLOSE_PROJECT_BUTTON = "🗑️ បិទ Project"
-HELP_BUTTON = "ℹ️ របៀបប្រើ"
 
 PROJECT_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        [NEW_PROJECT_BUTTON],
-        [UPLOAD_BUTTON, CLOSE_PROJECT_BUTTON],
-        [HELP_BUTTON],
-    ],
+    [[NEW_PROJECT_BUTTON]],
     resize_keyboard=True,
     is_persistent=True,
 )
@@ -66,7 +59,10 @@ PROJECT_KEYBOARD = ReplyKeyboardMarkup(
 sessions: dict[int, dict] = {}
 
 MAX_TTS_RETRIES = int(os.getenv("MAX_TTS_RETRIES", "3"))
-TTS_CONCURRENCY = int(os.getenv("TTS_CONCURRENCY", "4"))
+TTS_TIMEOUT_SECONDS = int(os.getenv("TTS_TIMEOUT_SECONDS", "90"))
+GEMINI_TIMEOUT_SECONDS = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "180"))
+TRANSLATION_RETRIES = int(os.getenv("TRANSLATION_RETRIES", "2"))
+TTS_CONCURRENCY = int(os.getenv("TTS_CONCURRENCY", "5"))
 MIN_SPEED = float(os.getenv("MIN_SPEED", "0.88"))
 MAX_SPEED = float(os.getenv("MAX_SPEED", "1.15"))
 
@@ -305,7 +301,7 @@ async def update_progress(
 ) -> None:
     percent = max(0, min(100, int(percent)))
     # កុំ Edit ញឹកញាប់ពេក ដើម្បីជៀសវាង Telegram rate limit។
-    if percent < 100 and percent - state.get("last_percent", -10) < 2:
+    if percent < 100 and percent - state.get("last_percent", -10) < 5:
         return
 
     state["last_percent"] = percent
@@ -363,48 +359,157 @@ def clean_gemini_output(text: str) -> str:
 
 def translation_prompt() -> str:
     return """
-You are an Expert Khmer Movie Subtitler and Emotional AI Dubbing Translator.
+You are KhmerDubAI V8, an Expert Khmer Movie Subtitler,
+Character Continuity Editor, and Emotional Dubbing Translator.
 
-Translate the supplied Chinese subtitle into natural spoken Khmer.
+TASK:
+Translate the complete Chinese SRT into natural spoken Khmer for movie dubbing.
 
-STRICT RULES:
-1. Return ONLY valid SRT. No Markdown and no explanations.
-2. Preserve every subtitle number and timestamp exactly.
-3. Do not omit, merge, reorder, or invent dialogue.
-4. Remove all Chinese characters from translated dialogue.
-5. Use short, fluent, emotionally natural spoken Khmer; never translate word-for-word.
-6. Match pronouns to age, rank, relationship, and scene context.
-7. Preserve anger, sadness, fear, love, comedy, sarcasm, crying, and urgency.
-8. Start every dialogue with exactly one voice tag and one emotion tag.
+NON-NEGOTIABLE OUTPUT:
+- Return ONLY valid SRT.
+- No Markdown, notes, explanations, or Chinese text.
+- Preserve every original subtitle number and timestamp exactly.
+- Preserve the same number of subtitle blocks.
+- Never omit, duplicate, merge, split, reorder, or invent dialogue.
 
-VOICE TAGS:
+KHMER LANGUAGE:
+1. Never translate word-for-word.
+2. Use fluent Cambodian spoken Khmer, not stiff written language.
+3. Keep the original meaning, hidden meaning, humor, sarcasm, and emotion.
+4. Keep each line concise enough for its timestamp.
+5. Use natural particles only where appropriate:
+   ណា, ណ៎, ហ្មង, តើ, អញ្ចឹង, វើយ, ហាស, ចា៎, ចុះ.
+6. Do not repeat words or sentences unless the original repeats them.
+
+CHARACTER CONTINUITY:
+1. Read the whole SRT as one continuous scene.
+2. Keep the same voice tag for the same speaker across nearby subtitle blocks.
+3. Do not randomly switch male/female, young/adult/old, or narrator tags.
+4. Infer speaker identity from names, titles, pronouns, previous lines,
+   replies, and scene continuity.
+5. Distinguish spoken dialogue from inner thought and narration.
+
+STATUS AND PRONOUNS:
+Choose Khmer pronouns and titles according to age, rank, relationship,
+historical setting, and emotional state.
+
+Examples:
+- Emperor/King: ព្រះអង្គ, ទូលបង្គំ, យើង
+- Queen/Princess/Prince: ព្រះនាង, ព្រះអង្គម្ចាស់
+- Master/Disciple: លោកគ្រូ, សិស្ស, គ្រូ, ឯង
+- General/Soldier: លោកឧត្តមសេនីយ៍, មេទ័ព, ទាហាន
+- Noble/Servant: លោកម្ចាស់, អ្នកបម្រើ, បាវបម្រើ
+- Elder/Junior: លោកតា, លោកយាយ, បង, អូន
+- Close friends/enemies: ពួកម៉ាក, សម្លាញ់, ឯង/អញ only when suitable
+
+VOICE TAGS — exactly one:
 [M_YOUNG] [F_YOUNG] [M_ADULT] [F_ADULT]
 [M_OLD] [F_OLD] [BOY] [GIRL]
 [M_THINK] [F_THINK] [NARRATOR_M] [NARRATOR_F]
 
-EMOTION TAGS:
+EMOTION TAGS — exactly one:
 [NEUTRAL] [HAPPY] [SAD] [ANGRY] [FEAR]
 [LOVE] [SARCASM] [CRYING] [THINKING]
 
-9. Infer the most likely speaker from wording and nearby context.
-10. If age is unclear, use [M_ADULT] or [F_ADULT].
-11. Keep Khmer concise enough to fit the original time window.
-12. One block must look exactly like:
+VOICE CLASSIFICATION:
+- Male speech → a male tag.
+- Female speech → a female tag.
+- Male inner monologue → [M_THINK][THINKING].
+- Female inner monologue → [F_THINK][THINKING].
+- Children → [BOY] or [GIRL].
+- Elderly speakers → [M_OLD] or [F_OLD].
+- Narration only → [NARRATOR_M] or [NARRATOR_F].
+- If age is uncertain, use adult.
+- If identity is uncertain, use nearby context and maintain continuity.
+
+EMOTION:
+- Angry dialogue must sound direct and forceful in Khmer.
+- Sad or crying dialogue must sound soft and emotionally natural.
+- Fear must sound urgent but remain understandable.
+- Love must sound gentle, not formal.
+- Sarcasm must preserve the mocking intent.
+- Neutral lines must not be exaggerated.
+
+FORMAT EXAMPLE:
 
 1
 00:00:01,000 --> 00:00:03,000
-[M_ADULT][ANGRY] ឯងហ៊ានក្បត់អញមែនទេ!
+[M_ADULT][ANGRY] ឯងហ៊ានធ្វើបាបនាងមែនទេ!
+
+2
+00:00:03,200 --> 00:00:05,000
+[F_THINK][THINKING] ហេតុអីគេមកដល់ទីនេះបាន?
+
+FINAL SELF-CHECK BEFORE RETURNING:
+- Valid SRT
+- Same numbering and timestamps
+- Same block count
+- No Chinese characters
+- No missing or repeated dialogue
+- Natural spoken Khmer
+- Stable speaker identity
+- Correct rank and pronouns
+- Correct voice and emotion tags
 """
 
 
-def translate_to_khmer_srt(source_srt: str) -> str:
-    response = gemini_client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=f"{translation_prompt()}\n\nINPUT:\n{source_srt}",
+def count_srt_blocks(srt_text: str) -> int:
+    normalized = srt_text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    return sum(
+        1
+        for block in re.split(r"\n\s*\n", normalized)
+        if re.match(r"^\s*\d+\s*\n", block)
     )
-    if not response.text:
-        raise RuntimeError("Gemini returned an empty response.")
-    return clean_gemini_output(response.text)
+
+
+def contains_chinese(text: str) -> bool:
+    return bool(re.search(r"[\u3400-\u4DBF\u4E00-\u9FFF]", text))
+
+
+def translate_to_khmer_srt(source_srt: str) -> str:
+    expected_blocks = count_srt_blocks(source_srt)
+    last_error = None
+
+    for attempt in range(1, TRANSLATION_RETRIES + 1):
+        try:
+            response = gemini_client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=(
+                    f"{translation_prompt()}\n\n"
+                    f"EXPECTED_BLOCK_COUNT: {expected_blocks}\n\n"
+                    f"INPUT SRT:\n{source_srt}"
+                ),
+            )
+            if not response.text:
+                raise RuntimeError("Gemini returned an empty response.")
+
+            result = clean_gemini_output(response.text)
+            actual_blocks = count_srt_blocks(result)
+
+            if actual_blocks != expected_blocks:
+                raise RuntimeError(
+                    f"SRT block count mismatch: "
+                    f"expected {expected_blocks}, got {actual_blocks}."
+                )
+            if contains_chinese(result):
+                raise RuntimeError(
+                    "Chinese characters remained in the Khmer SRT."
+                )
+
+            return result
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Translation attempt %s/%s failed: %s",
+                attempt,
+                TRANSLATION_RETRIES,
+                exc,
+            )
+
+    raise RuntimeError(
+        f"Translation failed after {TRANSLATION_RETRIES} attempts: "
+        f"{last_error}"
+    )
 
 
 def transcribe_to_srt(media_path: Path) -> str:
@@ -416,6 +521,7 @@ def transcribe_to_srt(media_path: Path) -> str:
         beam_size=1,
         best_of=1,
         condition_on_previous_text=False,
+        temperature=0.0,
     )
 
     blocks = []
@@ -582,7 +688,10 @@ async def synthesize_with_retry(cue: SubtitleCue, output_path: Path) -> None:
                 pitch=settings["pitch"],
                 volume=settings["volume"],
             )
-            await communicate.save(str(output_path))
+            await asyncio.wait_for(
+                communicate.save(str(output_path)),
+                timeout=TTS_TIMEOUT_SECONDS,
+            )
             if not output_path.exists() or output_path.stat().st_size < 100:
                 raise RuntimeError("Generated audio is empty.")
             return
@@ -624,6 +733,9 @@ async def prepare_cue_audio(
             "-filter:a",
             (
                 f"atempo={safe_speed:.6f},"
+                "highpass=f=70,lowpass=f=12500,"
+                "afade=t=in:st=0:d=0.025,"
+                f"afade=t=out:st={max(0.0, target_duration - 0.035):.3f}:d=0.035,"
                 f"apad=pad_dur={target_duration:.3f},"
                 f"atrim=0:{target_duration:.3f},"
                 "aresample=48000"
@@ -689,8 +801,9 @@ async def create_timed_dub_mp3(
     total_duration = max(cue.end for cue in cues) + 0.30
     filter_parts.append(
         f"{''.join(labels)}amix=inputs={len(labels)}:"
-        f"duration=longest:dropout_transition=0,"
-        f"alimiter=limit=0.95,"
+        f"duration=longest:dropout_transition=0.08,"
+        f"dynaudnorm=f=150:g=7,"
+        f"alimiter=limit=0.92,"
         f"atrim=0:{total_duration:.3f}[mix]"
     )
 
@@ -730,9 +843,12 @@ async def process_srt_upload(
         )
 
         await progress(15, "កំពុងបកប្រែជាភាសាខ្មែរ")
-        khmer_srt = await asyncio.to_thread(
-            translate_to_khmer_srt,
-            source_text,
+        khmer_srt = await asyncio.wait_for(
+            asyncio.to_thread(
+                translate_to_khmer_srt,
+                source_text,
+            ),
+            timeout=GEMINI_TIMEOUT_SECONDS,
         )
 
         km_path = tmpdir / "khmer_dub.srt"
@@ -813,9 +929,12 @@ async def process_media(
             )
 
         await progress(30, "ស្គាល់សំឡេងរួច កំពុងបកប្រែ")
-        khmer_srt = await asyncio.to_thread(
-            translate_to_khmer_srt,
-            chinese_srt,
+        khmer_srt = await asyncio.wait_for(
+            asyncio.to_thread(
+                translate_to_khmer_srt,
+                chinese_srt,
+            ),
+            timeout=GEMINI_TIMEOUT_SECONDS,
         )
 
         km_path = tmpdir / "khmer_dub.srt"
@@ -878,12 +997,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     session["last_activity"] = time.monotonic()
 
     message = await update.message.reply_text(
-        "🤖 KhmerDubAI Project Manager\n\n"
-        "មុនចាប់ផ្ដើម សូមចុច «🆕 ធ្វើថ្មី»។\n"
-        "បន្ទាប់មកផ្ញើវីដេអូ ឬសំឡេងរឿងចិន។\n\n"
-        "⏱ កំណត់វីដេអូ/សំឡេង៖ 5 នាទី ឬតិចជាងនេះ\n"
-        "📦 លទ្ធផល៖ khmer_dub.srt និង khmer_dub.mp3\n"
-        "⌛ គ្មានសកម្មភាព 10 នាទី Project នឹងផុតកំណត់។",
+        "🤖 KhmerDubAI Turbo Server\n\n"
+        "ចុច «🆕 ធ្វើថ្មី» រួចផ្ញើវីដេអូ ឬសំឡេងរឿងចិន។\n\n"
+        "⏱ កំណត់៖ 5 នាទី ឬតិចជាងនេះ\n"
+        "⚡ ដំណើរការនៅ Railway Server មិនពឹងកម្លាំងទូរសព្ទ\n"
+        "🎭 បែងចែកប្រុស ស្រី ក្មេង មនុស្សចាស់ និងសំឡេងគិត\n"
+        "📦 លទ្ធផល៖ khmer_dub.srt និង khmer_dub.mp3",
         reply_markup=PROJECT_KEYBOARD,
     )
     track_message(message)
@@ -897,71 +1016,10 @@ async def help_command(
         "ℹ️ របៀបប្រើ KhmerDubAI\n\n"
         "1. ចុច «🆕 ធ្វើថ្មី»\n"
         "2. ផ្ញើវីដេអូ ឬសំឡេង 5 នាទី ឬតិចជាងនេះ\n"
-        "3. មើល Progress 0%–100%\n"
-        "4. ទទួល khmer_dub.srt និង khmer_dub.mp3\n"
-        "5. ចុច «🗑️ បិទ Project» ពេលចប់\n\n"
-        "ប៊ូតុង «🆕 ធ្វើថ្មី» នឹងបញ្ឈប់ការងារចាស់ "
-        "និងសម្អាតសារគម្រោងចាស់ដែល Bot អាចលុបបាន។",
-        reply_markup=PROJECT_KEYBOARD,
-    )
-    track_message(message)
-
-
-async def upload_prompt(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    session = get_session(update.effective_chat.id)
-
-    if not session["active"]:
-        message = await update.message.reply_text(
-            "សូមចុច «🆕 ធ្វើថ្មី» ជាមុនសិន។",
-            reply_markup=PROJECT_KEYBOARD,
-        )
-    else:
-        message = await update.message.reply_text(
-            "📤 ឥឡូវផ្ញើវីដេអូ ឬសំឡេងរឿងចិនបាន។\n"
-            "⏱ ត្រូវមានរយៈពេល 5 នាទី ឬតិចជាងនេះ។",
-            reply_markup=PROJECT_KEYBOARD,
-        )
-
-    track_message(message)
-
-
-async def close_project(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    chat_id = update.effective_chat.id
-    session = get_session(chat_id)
-
-    running_task = session.get("processing_task")
-    if (
-        running_task
-        and not running_task.done()
-        and running_task is not asyncio.current_task()
-    ):
-        running_task.cancel()
-
-    expiry_task = session.get("expiry_task")
-    if expiry_task and not expiry_task.done():
-        expiry_task.cancel()
-
-    await clear_previous_project(
-        context.bot,
-        chat_id,
-        keep_message_id=update.message.message_id,
-    )
-
-    session["generation"] += 1
-    session["active"] = False
-    session["processing_task"] = None
-    session["last_activity"] = time.monotonic()
-    session["message_ids"] = {update.message.message_id}
-
-    message = await update.message.reply_text(
-        "🗑️ Project ត្រូវបានបិទ និងសម្អាតរួចរាល់។\n\n"
-        "ចុច «🆕 ធ្វើថ្មី» ដើម្បីចាប់ផ្ដើមម្ដងទៀត។",
+        "3. រង់ចាំ Progress 0%–100%\n"
+        "4. ទទួល khmer_dub.srt និង khmer_dub.mp3\n\n"
+        "ការបកប្រែ និងការបង្កើតសំឡេងធ្វើនៅលើ Railway Server។ "
+        "ទូរសព្ទប្រើតែសម្រាប់ Upload និង Download ប៉ុណ្ណោះ។",
         reply_markup=PROJECT_KEYBOARD,
     )
     track_message(message)
@@ -1259,24 +1317,6 @@ def main() -> None:
         )
     )
     application.add_handler(
-        MessageHandler(
-            filters.Regex(f"^{re.escape(UPLOAD_BUTTON)}$"),
-            upload_prompt,
-        )
-    )
-    application.add_handler(
-        MessageHandler(
-            filters.Regex(f"^{re.escape(CLOSE_PROJECT_BUTTON)}$"),
-            close_project,
-        )
-    )
-    application.add_handler(
-        MessageHandler(
-            filters.Regex(f"^{re.escape(HELP_BUTTON)}$"),
-            help_command,
-        )
-    )
-    application.add_handler(
         MessageHandler(filters.Document.ALL, handle_document)
     )
     application.add_handler(MessageHandler(filters.AUDIO, handle_audio))
@@ -1285,7 +1325,7 @@ def main() -> None:
     application.add_error_handler(error_handler)
 
     logger.info(
-        "KhmerDubAI New Project | max=%ss | idle=%ss | whisper=%s | parallel=%s",
+        "KhmerDubAI Turbo Server | max=%ss | idle=%ss | whisper=%s | parallel=%s",
         MAX_MEDIA_SECONDS,
         SESSION_IDLE_SECONDS,
         WHISPER_MODEL,
