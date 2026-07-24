@@ -14,8 +14,7 @@ from typing import Awaitable, Callable, Optional
 
 import edge_tts
 from faster_whisper import WhisperModel
-import torch
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from deep_translator import GoogleTranslator
 from telegram import Message, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
@@ -71,17 +70,10 @@ def env_bool(name: str, default: bool) -> bool:
 
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-LOCAL_TRANSLATION_MODEL = os.getenv(
-    "LOCAL_TRANSLATION_MODEL",
-    "facebook/nllb-200-distilled-600M",
-).strip()
-TRANSLATION_DEVICE = os.getenv(
-    "TRANSLATION_DEVICE",
-    "cuda" if torch.cuda.is_available() else "cpu",
-).strip()
-TRANSLATION_BATCH_SIZE = env_int("TRANSLATION_BATCH_SIZE", 4, 1)
-TRANSLATION_MAX_INPUT_TOKENS = env_int("TRANSLATION_MAX_INPUT_TOKENS", 256, 32)
-TRANSLATION_MAX_NEW_TOKENS = env_int("TRANSLATION_MAX_NEW_TOKENS", 256, 32)
+TRANSLATION_SOURCE = os.getenv("TRANSLATION_SOURCE", "zh-CN").strip()
+TRANSLATION_TARGET = os.getenv("TRANSLATION_TARGET", "km").strip()
+TRANSLATION_DELAY_SECONDS = env_float("TRANSLATION_DELAY_SECONDS", 0.15, 0.0)
+TRANSLATION_MAX_CHARS = env_int("TRANSLATION_MAX_CHARS", 3000, 100)
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base").strip()
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu").strip()
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8").strip()
@@ -97,8 +89,8 @@ DELETE_OUTPUT_MESSAGES = env_bool("DELETE_OUTPUT_MESSAGES", True)
 MAX_TTS_RETRIES = env_int("MAX_TTS_RETRIES", 3, 1)
 TRANSLATION_RETRIES = env_int("TRANSLATION_RETRIES", 3, 1)
 TTS_TIMEOUT_SECONDS = env_int("TTS_TIMEOUT_SECONDS", 90, 5)
-LOCAL_TRANSLATION_TIMEOUT_SECONDS = env_int(
-    "LOCAL_TRANSLATION_TIMEOUT_SECONDS", 900, 30
+TRANSLATION_TIMEOUT_SECONDS = env_int(
+    "TRANSLATION_TIMEOUT_SECONDS", 900, 30
 )
 SUBPROCESS_TIMEOUT_SECONDS = env_int("SUBPROCESS_TIMEOUT_SECONDS", 300, 10)
 TTS_CONCURRENCY = env_int("TTS_CONCURRENCY", 4, 1)
@@ -169,9 +161,6 @@ sessions: dict[int, ChatSession] = {}
 
 _whisper_model: WhisperModel | None = None
 _whisper_lock = asyncio.Lock()
-_translation_tokenizer = None
-_translation_model = None
-_translation_lock = asyncio.Lock()
 
 
 VOICE_PROFILES = {
@@ -466,43 +455,15 @@ def contains_chinese(text: str) -> bool:
     return bool(re.search(r"[\u3400-\u4DBF\u4E00-\u9FFF]", text))
 
 
-def get_translation_components():
-    """Load the free local NLLB model once and reuse it for all jobs."""
-    global _translation_tokenizer, _translation_model
-
-    if _translation_tokenizer is None or _translation_model is None:
-        logger.info(
-            "Loading local translation model=%s device=%s",
-            LOCAL_TRANSLATION_MODEL,
-            TRANSLATION_DEVICE,
-        )
-        _translation_tokenizer = AutoTokenizer.from_pretrained(
-            LOCAL_TRANSLATION_MODEL,
-            src_lang="zho_Hans",
-        )
-        dtype = torch.float16 if TRANSLATION_DEVICE.startswith("cuda") else torch.float32
-        _translation_model = AutoModelForSeq2SeqLM.from_pretrained(
-            LOCAL_TRANSLATION_MODEL,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-        )
-        _translation_model.to(TRANSLATION_DEVICE)
-        _translation_model.eval()
-
-    return _translation_tokenizer, _translation_model
-
-
 def infer_emotion(source_text: str) -> str:
     text = source_text.strip()
     if any(mark in text for mark in ("!", "！", "滚", "住手", "混蛋", "该死")):
         return "ANGRY"
-    if any(mark in text for mark in ("?", "？", "怎么", "为什么", "什么")):
-        return "NEUTRAL"
-    if any(mark in text for mark in ("哭", "死", "对不起", "难过", "伤心")):
-        return "SAD"
-    if any(mark in text for mark in ("怕", "救命", "危险", "不要过来")):
+    if any(mark in text for mark in ("?", "？", "怎么", "为什么", "谁")):
         return "FEAR"
-    if any(mark in text for mark in ("爱", "喜欢", "想你", "亲爱的")):
+    if any(mark in text for mark in ("哭", "死", "对不起", "不要离开")):
+        return "SAD"
+    if any(mark in text for mark in ("爱", "喜欢", "想你")):
         return "LOVE"
     if any(mark in text for mark in ("哈哈", "呵呵", "太好了")):
         return "HAPPY"
@@ -510,11 +471,7 @@ def infer_emotion(source_text: str) -> str:
 
 
 def infer_voice_tag(source_text: str, previous_tag: str) -> str:
-    """Best-effort offline speaker tag selection.
-
-    A translation model cannot identify actors from audio. We keep the nearby
-    speaker stable and use obvious Chinese wording only when it gives a clue.
-    """
+    """Best-effort speaker tag selection from subtitle wording."""
     text = source_text.strip()
     if any(word in text for word in ("旁白", "解说", "画外音")):
         return "NARRATOR_M"
@@ -533,71 +490,95 @@ def parse_plain_srt(source_srt: str) -> list[tuple[int, str, str]]:
             raise ValueError(f"Invalid subtitle block: {block[:120]!r}")
         index = int(lines[0])
         timestamp = re.sub(r"\s+", " ", lines[1]).replace(".", ",")
-        text = " ".join(lines[2:]).strip()
-        text = re.sub(r"^\[[A-Z_]+\]\[[A-Z_]+\]\s*", "", text)
-        if not text:
+        dialogue = " ".join(lines[2:]).strip()
+        dialogue = re.sub(r"^\[[A-Z_]+\]\[[A-Z_]+\]\s*", "", dialogue)
+        if not dialogue:
             raise ValueError(f"Cue {index} has empty dialogue")
-        cues.append((index, timestamp, text))
+        cues.append((index, timestamp, dialogue))
     return cues
 
 
-def translate_text_batch(texts: list[str]) -> list[str]:
-    tokenizer, model = get_translation_components()
-    tokenizer.src_lang = "zho_Hans"
+def _split_translation_text(text: str, limit: int) -> list[str]:
+    """Split long text without breaking ordinary short subtitle lines."""
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return [text]
+    pieces = re.split(r"(?<=[。！？!?；;，,])", text)
+    chunks: list[str] = []
+    current = ""
+    for piece in pieces:
+        piece = piece.strip()
+        if not piece:
+            continue
+        if current and len(current) + 1 + len(piece) > limit:
+            chunks.append(current)
+            current = piece
+        else:
+            current = f"{current} {piece}".strip()
+    if current:
+        chunks.append(current)
+    return chunks or [text[:limit]]
 
-    encoded = tokenizer(
-        texts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=TRANSLATION_MAX_INPUT_TOKENS,
-    )
-    encoded = {key: value.to(TRANSLATION_DEVICE) for key, value in encoded.items()}
 
-    with torch.inference_mode():
-        generated = model.generate(
-            **encoded,
-            forced_bos_token_id=tokenizer.convert_tokens_to_ids("khm_Khmr"),
-            max_new_tokens=TRANSLATION_MAX_NEW_TOKENS,
-            num_beams=3,
-            repetition_penalty=1.08,
-            no_repeat_ngram_size=3,
-        )
+def translate_text_free(text: str) -> str:
+    """Translate one Chinese subtitle to Khmer with no API key.
 
-    results = tokenizer.batch_decode(generated, skip_special_tokens=True)
-    return [re.sub(r"\s+", " ", item).strip() for item in results]
+    This uses Google Translate's public web endpoint through deep-translator.
+    It is lightweight and avoids loading the multi-gigabyte NLLB/Torch model.
+    """
+    last_error: Exception | None = None
+    chunks = _split_translation_text(text, TRANSLATION_MAX_CHARS)
+    translated_chunks: list[str] = []
+
+    for chunk in chunks:
+        for attempt in range(1, TRANSLATION_RETRIES + 1):
+            try:
+                result = GoogleTranslator(
+                    source=TRANSLATION_SOURCE,
+                    target=TRANSLATION_TARGET,
+                ).translate(chunk)
+                result = re.sub(r"\s+", " ", result or "").strip()
+                if not result:
+                    raise RuntimeError("translation service returned empty text")
+                translated_chunks.append(result)
+                if TRANSLATION_DELAY_SECONDS:
+                    time.sleep(TRANSLATION_DELAY_SECONDS)
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt >= TRANSLATION_RETRIES:
+                    raise RuntimeError(
+                        "Free translation service failed after "
+                        f"{TRANSLATION_RETRIES} attempts: {exc}"
+                    ) from exc
+                time.sleep(min(2 ** attempt, 8))
+
+    result = " ".join(translated_chunks).strip()
+    if not result and last_error:
+        raise RuntimeError(str(last_error))
+    return result
 
 
 def translate_to_khmer_srt(source_srt: str) -> str:
-    """Translate Chinese SRT to Khmer locally without any paid API key."""
+    """Translate SRT to Khmer without Gemini, Torch, or a paid API key."""
     expected_signature = srt_signature(source_srt)
     source_cues = parse_plain_srt(source_srt)
-    translated: list[str] = []
-
-    for offset in range(0, len(source_cues), TRANSLATION_BATCH_SIZE):
-        batch = source_cues[offset : offset + TRANSLATION_BATCH_SIZE]
-        batch_texts = [cue[2] for cue in batch]
-        translated.extend(translate_text_batch(batch_texts))
-
-    if len(translated) != len(source_cues):
-        raise RuntimeError("Local translator returned the wrong number of subtitles")
-
     blocks: list[str] = []
     previous_tag = "M_ADULT"
-    for (index, timestamp, source_text), khmer_text in zip(source_cues, translated):
+
+    for index, timestamp, source_text in source_cues:
+        khmer_text = translate_text_free(source_text)
         khmer_text = re.sub(r"[\u3400-\u4DBF\u4E00-\u9FFF]+", "", khmer_text).strip()
         if not khmer_text:
-            khmer_text = "…"
+            raise RuntimeError(f"Cue {index} could not be translated to Khmer")
         tag = infer_voice_tag(source_text, previous_tag)
         emotion = infer_emotion(source_text)
         previous_tag = tag
-        blocks.append(
-            f"{index}\n{timestamp}\n[{tag}][{emotion}] {khmer_text}"
-        )
+        blocks.append(f"{index}\n{timestamp}\n[{tag}][{emotion}] {khmer_text}")
 
     result = "\n\n".join(blocks) + "\n"
     if srt_signature(result) != expected_signature:
-        raise RuntimeError("Local translation changed subtitle numbering or timestamps")
+        raise RuntimeError("Translation changed subtitle numbering or timestamps")
     if contains_chinese(result):
         raise RuntimeError("Chinese characters remained in Khmer SRT")
     parse_tagged_srt(result)
@@ -1112,7 +1093,7 @@ async def process_source(
 
         khmer_srt = await asyncio.wait_for(
             asyncio.to_thread(translate_to_khmer_srt, source_srt),
-            timeout=LOCAL_TRANSLATION_TIMEOUT_SECONDS,
+            timeout=TRANSLATION_TIMEOUT_SECONDS,
         )
 
         srt_path = tmpdir / "khmer_dub.srt"
@@ -1135,8 +1116,19 @@ async def process_source(
     except asyncio.CancelledError:
         schedule_delete(status)
         raise
-    except Exception:
-        schedule_delete(status)
+    except Exception as exc:
+        logger.exception("Media processing failed")
+        friendly = str(exc).strip() or exc.__class__.__name__
+        if len(friendly) > 700:
+            friendly = friendly[:700] + "…"
+        try:
+            await status.edit_text(
+                "❌ ការងារមិនបានសម្រេច\n\n"
+                f"មូលហេតុ៖ {friendly}\n\n"
+                "សូមសាកវីដេអូខ្លី 20–30 វិនាទី ឬផ្ញើ SRT មកសាកជាមុន។"
+            )
+        except Exception:
+            pass
         raise
 
 
@@ -1246,7 +1238,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "ចុច «🆕 ធ្វើថ្មី» រួចផ្ញើវីដេអូ សំឡេង ឬ SRT រឿងចិន។\n\n"
         f"⏱ កំណត់៖ {MAX_MEDIA_SECONDS // 60} នាទី ឬតិចជាងនេះ\n"
         "🎭 បែងចែកប្រុស ស្រី ក្មេង មនុស្សចាស់ និងសំឡេងគិត\n"
-        "🆓 មិនត្រូវការ Gemini API Key\n"
+        "🆓 មិនត្រូវការ Gemini API Key ឬម៉ូដែល NLLB ធំៗ\n"
         "📦 លទ្ធផល៖ khmer_dub.srt និង khmer_dub.mp3",
         reply_markup=PROJECT_KEYBOARD,
     )
@@ -1500,7 +1492,7 @@ def main() -> None:
 
     logger.info(
         "KhmerDubAI | max=%ss | idle=%ss | whisper=%s | "
-        "tts_parallel=%s | update_parallel=%s",
+        "translator=free-web | tts_parallel=%s | update_parallel=%s",
         MAX_MEDIA_SECONDS,
         SESSION_IDLE_SECONDS,
         WHISPER_MODEL,
