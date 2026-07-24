@@ -1,19 +1,40 @@
-# KhmerDubAI Lightweight Fixed
+# AI KHEMRA BRO — KhmerDubAI Website
 
-This build removes Gemini, Torch, Transformers, and the large NLLB model.
+Website Streamlit សម្រាប់ប្រើក្នុង Google Chrome លើ iPhone, Android និងកុំព្យូទ័រ។
 
-## Required environment variable
+## មុខងារ
 
-- `TELEGRAM_BOT_TOKEN`
+1. Upload Video
+2. Extract Audio
+3. Upload/Paste Subtitle
+4. Translate to Khmer with Gemini
+5. Edit and Download Khmer SRT
+6. Generate Khmer MP3 with Edge-TTS
+7. Merge Khmer MP3 with Video
+8. Download MP4
 
-## Recommended environment variables
+## Railway Variable
 
-- `WHISPER_MODEL=tiny` (best for low-memory free servers)
-- `WHISPER_DEVICE=cpu`
-- `WHISPER_COMPUTE_TYPE=int8`
-- `MAX_MEDIA_SECONDS=180`
-- `TRANSLATION_RETRIES=3`
+បន្ថែម Variable នេះនៅ Railway:
 
-## Important
+```text
+GEMINI_API_KEY=YOUR_GEMINI_API_KEY
+```
 
-Translation uses the free public Google Translate web endpoint through `deep-translator`. It needs internet, has no API key, and may occasionally be rate-limited.
+Variable ជាជម្រើសបន្ថែម:
+
+```text
+GEMINI_MODEL=gemini-2.5-flash
+```
+
+## Deploy
+
+1. Upload ឯកសារទាំងអស់ទៅ GitHub repository។
+2. ចូល Railway។
+3. Redeploy project។
+4. ចូល Settings → Networking → Generate Domain។
+5. បើក Domain ក្នុង Google Chrome។
+
+## សុវត្ថិភាព
+
+កុំដាក់ Gemini API Key ក្នុង GitHub code។ ដាក់វានៅ Railway Variables តែប៉ុណ្ណោះ។
