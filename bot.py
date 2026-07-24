@@ -1356,7 +1356,8 @@ async def help_command(
         "1. ចុច «🆕 ធ្វើថ្មី»\n"
         f"2. ផ្ញើវីដេអូ សំឡេង ឬ SRT មិនលើស {MAX_MEDIA_SECONDS // 60} នាទី\n"
         "3. រង់ចាំ Progress 0%–100%\n"
-        "4. ទទួល khmer_dub.srt និង khmer_dub.mp3",
+        "4. ទទួល khmer_dub.srt និង khmer_dub.mp3\n\n"
+        "🎙 សាកសំឡេង៖ /female អត្ថបទខ្មែរ ឬ /male អត្ថបទខ្មែរ",
         reply_markup=PROJECT_KEYBOARD,
     )
     track_message(reply)
@@ -1407,56 +1408,105 @@ async def voice_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
+    """Generate a quick Khmer voice sample.
+
+    Commands:
+      /female text  -> Sreymom
+      /male text    -> Piseth
+      /voice female text / /voice male text
+
+    /voice defaults to Sreymom so the female voice can be tested directly.
+    """
     message = update.effective_message
     if message is None:
         return
 
-    text = " ".join(context.args).strip()
+    command = "voice"
+    if message.text:
+        first_token = message.text.strip().split(maxsplit=1)[0]
+        command = first_token.split("@", 1)[0].lstrip("/").lower()
+
+    args = list(context.args)
+    selected_voice = FEMALE_VOICE
+    voice_label = "Sreymom"
+
+    if command == "male":
+        selected_voice = MALE_VOICE
+        voice_label = "Piseth"
+    elif command == "female":
+        selected_voice = FEMALE_VOICE
+        voice_label = "Sreymom"
+    elif args:
+        selector = args[0].strip().lower()
+        if selector in {"f", "female", "woman", "sreymom", "ស្រី", "ស្រីមុំ"}:
+            selected_voice = FEMALE_VOICE
+            voice_label = "Sreymom"
+            args.pop(0)
+        elif selector in {"m", "male", "man", "piseth", "ប្រុស", "ពិសិដ្ឋ"}:
+            selected_voice = MALE_VOICE
+            voice_label = "Piseth"
+            args.pop(0)
+
+    text = " ".join(args).strip()
     if not text and message.reply_to_message:
         text = (message.reply_to_message.text or "").strip()
 
     if not text:
         reply = await message.reply_text(
-            "ប្រើ៖ /voice អត្ថបទខ្មែរ\n"
-            "ឬ Reply លើសារខ្មែរ ហើយផ្ញើ /voice"
+            "ប្រើ៖\n"
+            "/female អត្ថបទខ្មែរ — សំឡេងស្រីមុំ\n"
+            "/male អត្ថបទខ្មែរ — សំឡេងពិសិដ្ឋ\n"
+            "/voice female អត្ថបទខ្មែរ\n"
+            "ឬ Reply លើសារខ្មែរ ហើយផ្ញើ /female ឬ /male"
         )
         schedule_delete(reply)
         return
 
     if len(text) > 3000:
         reply = await message.reply_text(
-            "អត្ថបទវែងពេក។ /voice អនុញ្ញាតអតិបរមា 3000 តួអក្សរ។"
+            "អត្ថបទវែងពេក។ អនុញ្ញាតអតិបរមា 3000 តួអក្សរ។"
         )
         schedule_delete(reply)
         return
 
     with tempfile.TemporaryDirectory(prefix="khmerdubai_voice_") as tmp:
-        output_path = Path(tmp) / "khmer_voice.mp3"
+        output_path = Path(tmp) / f"khmer_{voice_label.lower()}_voice.mp3"
         try:
             await message.chat.send_action(ChatAction.RECORD_VOICE)
+            communicate = edge_tts.Communicate(
+                text=text,
+                voice=selected_voice,
+                rate="+0%",
+                pitch="+0Hz",
+                volume="+0%",
+            )
             await asyncio.wait_for(
-                edge_tts.Communicate(
-                    text=text,
-                    voice=MALE_VOICE,
-                ).save(str(output_path)),
+                communicate.save(str(output_path)),
                 timeout=TTS_TIMEOUT_SECONDS,
             )
+            if not output_path.exists() or output_path.stat().st_size < 100:
+                raise RuntimeError("Generated TTS audio is empty")
+
             with output_path.open("rb") as audio:
                 result = await message.reply_audio(
                     audio=audio,
-                    filename="khmer_voice.mp3",
-                    title="KhmerDubAI Voice",
+                    filename=output_path.name,
+                    title=f"Khmer {voice_label} Voice",
                     caption=(
-                        f"🗑 នឹងលុបក្រោយ {AUTO_DELETE_MINUTES} នាទី"
-                        if AUTO_DELETE_MINUTES > 0
-                        else None
-                    ),
+                        f"🎙 សំឡេង៖ {voice_label} ({selected_voice})\n"
+                        + (
+                            f"🗑 នឹងលុបក្រោយ {AUTO_DELETE_MINUTES} នាទី"
+                            if AUTO_DELETE_MINUTES > 0
+                            else ""
+                        )
+                    ).strip(),
                 )
             schedule_delete(result, DELETE_OUTPUT_MESSAGES)
         except Exception as exc:
-            logger.exception("/voice TTS failed")
+            logger.exception("/%s TTS failed with voice=%s", command, selected_voice)
             reply = await message.reply_text(
-                f"❌ មិនអាចបង្កើតសំឡេងបាន៖ {exc}"
+                f"❌ សំឡេង {voice_label} មិនអាចបង្កើតបាន៖ {exc}\n"
+                f"Voice: {selected_voice}"
             )
             schedule_delete(reply)
 
@@ -1577,6 +1627,8 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("voice", voice_command))
+    application.add_handler(CommandHandler("female", voice_command))
+    application.add_handler(CommandHandler("male", voice_command))
     application.add_handler(
         MessageHandler(
             filters.Regex(f"^{re.escape(NEW_PROJECT_BUTTON)}$"),
