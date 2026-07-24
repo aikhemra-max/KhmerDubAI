@@ -97,7 +97,7 @@ TTS_CONCURRENCY = env_int("TTS_CONCURRENCY", 4, 1)
 UPDATE_CONCURRENCY = env_int("UPDATE_CONCURRENCY", 8, 1)
 
 MIN_SPEED = env_float("MIN_SPEED", 0.88, 0.5)
-MAX_SPEED = env_float("MAX_SPEED", 1.15, 0.5)
+MAX_SPEED = env_float("MAX_SPEED", 1.85, 0.5)
 if MIN_SPEED > MAX_SPEED:
     raise RuntimeError("MIN_SPEED cannot be greater than MAX_SPEED")
 
@@ -833,12 +833,26 @@ async def synthesize_with_retry(cue: SubtitleCue, output_path: Path) -> None:
     )
 
 
+def build_atempo_filter(speed: float) -> str:
+    """Build a legal FFmpeg atempo chain without cutting spoken words."""
+    speed = max(0.25, min(4.0, speed))
+    factors: list[float] = []
+    while speed > 2.0:
+        factors.append(2.0)
+        speed /= 2.0
+    while speed < 0.5:
+        factors.append(0.5)
+        speed /= 0.5
+    factors.append(speed)
+    return ",".join(f"atempo={factor:.6f}" for factor in factors)
+
+
 async def prepare_cue_audio(
     position: int,
     cue: SubtitleCue,
     workdir: Path,
     semaphore: asyncio.Semaphore,
-) -> tuple[int, Path, int]:
+) -> tuple[int, Path, int, float]:
     raw_path = workdir / f"cue_{position:05d}_raw.mp3"
     fit_path = workdir / f"cue_{position:05d}_fit.wav"
 
@@ -847,18 +861,18 @@ async def prepare_cue_audio(
 
     raw_duration = await asyncio.to_thread(ffprobe_duration, raw_path)
     target_duration = max(0.25, cue.end - cue.start)
-    speed = max(MIN_SPEED, min(MAX_SPEED, raw_duration / target_duration))
+    requested_speed = raw_duration / target_duration
+    speed = max(MIN_SPEED, min(MAX_SPEED, requested_speed))
 
-    fade_out_start = max(0.0, target_duration - 0.035)
+    # Never hard-trim TTS at the subtitle end. Hard trimming was the main cause
+    # of broken final syllables and choppy playback. A tiny fade only removes
+    # encoder clicks; the complete spoken sentence is preserved.
     audio_filter = (
-        f"atempo={speed:.6f},"
-        "highpass=f=70,"
-        "lowpass=f=12500,"
-        "afade=t=in:st=0:d=0.025,"
-        f"afade=t=out:st={fade_out_start:.3f}:d=0.035,"
-        f"apad=pad_dur={target_duration:.3f},"
-        f"atrim=0:{target_duration:.3f},"
-        "aresample=48000"
+        f"{build_atempo_filter(speed)},"
+        "highpass=f=65,"
+        "lowpass=f=13500,"
+        "afade=t=in:st=0:d=0.008,"
+        "aresample=48000:async=1:first_pts=0"
     )
 
     await asyncio.to_thread(
@@ -877,7 +891,8 @@ async def prepare_cue_audio(
             str(fit_path),
         ],
     )
-    return position, fit_path, round(cue.start * 1000)
+    fitted_duration = await asyncio.to_thread(ffprobe_duration, fit_path)
+    return position, fit_path, round(cue.start * 1000), fitted_duration
 
 
 async def create_timed_dub_mp3(
@@ -898,7 +913,7 @@ async def create_timed_dub_mp3(
         for i, cue in enumerate(cues, start=1)
     ]
 
-    results: list[tuple[int, Path, int]] = []
+    results: list[tuple[int, Path, int, float]] = []
     try:
         for completed, task in enumerate(asyncio.as_completed(tasks), start=1):
             results.append(await task)
@@ -922,25 +937,31 @@ async def create_timed_dub_mp3(
         await progress(88, "កំពុងតម្រៀបសំឡេងតាម Timestamp")
 
     command = ["ffmpeg", "-y"]
-    for _position, path, _delay in results:
+    for _position, path, _delay, _duration in results:
         command.extend(["-i", str(path)])
 
     filter_parts: list[str] = []
     labels: list[str] = []
-    for input_index, (_position, _path, delay_ms) in enumerate(results):
+    for input_index, (_position, _path, delay_ms, _duration) in enumerate(results):
         label = f"a{input_index}"
         filter_parts.append(
             f"[{input_index}:a]adelay={delay_ms}:all=1[{label}]"
         )
         labels.append(f"[{label}]")
 
-    total_duration = max(cue.end for cue in cues) + 0.30
+    total_duration = max(
+        cue.end for cue in cues
+    )
+    for (_position, _path, delay_ms, fitted_duration) in results:
+        total_duration = max(total_duration, delay_ms / 1000 + fitted_duration)
+    total_duration += 0.20
+
     filter_parts.append(
         f"{''.join(labels)}"
-        f"amix=inputs={len(labels)}:duration=longest:dropout_transition=0,"
-        "dynaudnorm=f=150:g=7,"
-        "alimiter=limit=0.92,"
-        f"atrim=0:{total_duration:.3f}[mix]"
+        f"amix=inputs={len(labels)}:duration=longest:dropout_transition=0:normalize=0,"
+        "acompressor=threshold=-18dB:ratio=2.2:attack=12:release=180:makeup=1.5dB,"
+        "alimiter=limit=0.95:attack=5:release=80,"
+        f"apad=pad_dur=0.20,atrim=0:{total_duration:.3f}[mix]"
     )
 
     command.extend(
@@ -956,7 +977,7 @@ async def create_timed_dub_mp3(
             "-c:a",
             "libmp3lame",
             "-b:a",
-            "160k",
+            "192k",
             str(output_path),
         ]
     )
