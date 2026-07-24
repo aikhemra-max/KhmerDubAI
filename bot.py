@@ -8,6 +8,9 @@ import shutil
 import subprocess
 import tempfile
 import time
+import json
+
+import requests
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
@@ -72,6 +75,13 @@ def env_bool(name: str, default: bool) -> bool:
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TRANSLATION_SOURCE = os.getenv("TRANSLATION_SOURCE", "zh-CN").strip()
 TRANSLATION_TARGET = os.getenv("TRANSLATION_TARGET", "km").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+GEMINI_API_BASE = os.getenv(
+    "GEMINI_API_BASE",
+    "https://generativelanguage.googleapis.com/v1beta",
+).rstrip("/")
+USE_GEMINI_TRANSLATION = env_bool("USE_GEMINI_TRANSLATION", True)
 TRANSLATION_DELAY_SECONDS = env_float("TRANSLATION_DELAY_SECONDS", 0.15, 0.0)
 TRANSLATION_MAX_CHARS = env_int("TRANSLATION_MAX_CHARS", 3000, 100)
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base").strip()
@@ -497,19 +507,38 @@ def infer_emotion(source_text: str) -> str:
 
 
 def infer_voice_tag(source_text: str, previous_tag: str) -> str:
-    """Best-effort speaker tag selection from subtitle wording."""
-    text = source_text.strip()
-    if any(word in text for word in ("旁白", "解说", "画外音")):
-        return "NARRATOR_M"
-    if any(word in text for word in ("娘", "姐姐", "妹妹", "小姐", "夫人", "奶奶")):
-        return "F_ADULT"
-    if any(word in text for word in ("爹", "哥哥", "弟弟", "公子", "大人", "爷爷")):
-        return "M_ADULT"
-    return previous_tag or "M_ADULT"
+    """Conservative fallback used only when no speaker label is available.
+
+    Do not guess gender from words such as sister, lord, mother, or father,
+    because those words usually identify the person being addressed, not the
+    person speaking. Existing [M]/[F]/[M_THINK]/[F_THINK] labels always win.
+    """
+    return previous_tag if previous_tag in VALID_TAGS else "M_ADULT"
 
 
-def parse_plain_srt(source_srt: str) -> list[tuple[int, str, str]]:
-    cues: list[tuple[int, str, str]] = []
+def _extract_source_label(dialogue: str) -> tuple[str | None, str | None, str]:
+    """Return optional voice tag, emotion, and clean source dialogue."""
+    match = re.fullmatch(
+        r"\[([^\]]+)\](?:\[([^\]]+)\])?\s*(.+)",
+        dialogue.strip(),
+        flags=re.S,
+    )
+    if not match:
+        return None, None, dialogue.strip()
+    raw_tag, raw_emotion, text = match.groups()
+    normalized = re.sub(r"[^A-Z0-9_]", "", raw_tag.upper())
+    tag = VOICE_TAG_ALIASES.get(normalized, normalized)
+    if tag not in VALID_TAGS:
+        return None, None, dialogue.strip()
+    emotion = None
+    if raw_emotion:
+        candidate = re.sub(r"[^A-Z0-9_]", "", raw_emotion.upper())
+        if candidate in VALID_EMOTIONS:
+            emotion = candidate
+    return tag, emotion, text.strip()
+
+def parse_plain_srt(source_srt: str) -> list[tuple[int, str, str, str | None, str | None]]:
+    cues: list[tuple[int, str, str, str | None, str | None]] = []
     for block in split_srt_blocks(source_srt):
         lines = [line.strip() for line in block.splitlines() if line.strip()]
         if len(lines) < 3:
@@ -517,12 +546,97 @@ def parse_plain_srt(source_srt: str) -> list[tuple[int, str, str]]:
         index = int(lines[0])
         timestamp = re.sub(r"\s+", " ", lines[1]).replace(".", ",")
         dialogue = " ".join(lines[2:]).strip()
-        dialogue = re.sub(r"^\[[A-Z_]+\]\[[A-Z_]+\]\s*", "", dialogue)
-        if not dialogue:
+        tag, emotion, clean_dialogue = _extract_source_label(dialogue)
+        if not clean_dialogue:
             raise ValueError(f"Cue {index} has empty dialogue")
-        cues.append((index, timestamp, dialogue))
+        cues.append((index, timestamp, clean_dialogue, tag, emotion))
     return cues
 
+
+KHMER_TRANSLATION_PROMPT = r"""
+You are an Expert Khmer Subtitler & Dubbing Translator for movies and drama.
+Translate every source subtitle into fluent, natural spoken Khmer suitable for
+real Khmer voice acting. Never translate word-for-word. Choose language that
+fits the setting: royal/court language for kings, queens, princes, officials,
+monks, and palace scenes; ordinary natural Khmer for common people and modern
+life. Preserve emotion, hidden meaning, relationships, status, age, and tone.
+Keep each line concise enough for the original speaking duration.
+
+Speaker labels allowed only:
+[M] male dialogue
+[F] female dialogue
+[M_THINK] male inner thought
+[F_THINK] female inner thought
+
+Critical rules:
+1. Preserve every SRT index and timestamp exactly.
+2. Do not skip, merge, split, reorder, or invent cues.
+3. Keep an existing speaker label exactly when supplied.
+4. For an unlabeled cue, determine the speaker from context. Do not infer the
+   speaker merely from words used to address another person.
+5. Output Khmer only after the label. Remove all Chinese characters.
+6. No Markdown, explanations, HTML, XML, emoji, or notes.
+7. Return valid SRT only.
+""".strip()
+
+
+def _gemini_generate(prompt: str) -> str:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is missing")
+    url = f"{GEMINI_API_BASE}/models/{GEMINI_MODEL}:generateContent"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.25,
+            "topP": 0.9,
+            "responseMimeType": "text/plain",
+        },
+    }
+    response = requests.post(
+        url,
+        params={"key": GEMINI_API_KEY},
+        json=payload,
+        timeout=TRANSLATION_TIMEOUT_SECONDS,
+    )
+    if response.status_code >= 400:
+        detail = response.text[:500]
+        raise RuntimeError(
+            f"Gemini translation HTTP {response.status_code}: {detail}"
+        )
+    data = response.json()
+    candidates = data.get("candidates") or []
+    if not candidates:
+        raise RuntimeError("Gemini returned no translation candidate")
+    parts = candidates[0].get("content", {}).get("parts", [])
+    text = "".join(str(part.get("text", "")) for part in parts).strip()
+    text = re.sub(r"^```(?:srt)?\s*|\s*```$", "", text, flags=re.I | re.S).strip()
+    if not text:
+        raise RuntimeError("Gemini returned empty translation text")
+    return text
+
+
+def translate_srt_with_gemini(source_srt: str) -> str:
+    expected = srt_signature(source_srt)
+    prompt = (
+        KHMER_TRANSLATION_PROMPT
+        + "\n\nSOURCE SRT:\n"
+        + normalize_srt(source_srt).strip()
+    )
+    last_error: Exception | None = None
+    for attempt in range(1, TRANSLATION_RETRIES + 1):
+        try:
+            result = _gemini_generate(prompt)
+            if srt_signature(result) != expected:
+                raise RuntimeError("AI changed subtitle numbering or timestamps")
+            if contains_chinese(result):
+                raise RuntimeError("Chinese characters remained in translated SRT")
+            parse_tagged_srt(result)
+            return normalize_srt(result).strip() + "\n"
+        except Exception as exc:
+            last_error = exc
+            if attempt < TRANSLATION_RETRIES:
+                time.sleep(min(2 ** attempt, 10))
+    raise RuntimeError(f"Gemini translation failed: {last_error}")
 
 def _split_translation_text(text: str, limit: int) -> list[str]:
     """Split long text without breaking ordinary short subtitle lines."""
@@ -586,21 +700,33 @@ def translate_text_free(text: str) -> str:
 
 
 def translate_to_khmer_srt(source_srt: str) -> str:
-    """Translate SRT to Khmer without Gemini, Torch, or a paid API key."""
+    """Translate, label, validate, then return dubbing-ready Khmer SRT."""
     expected_signature = srt_signature(source_srt)
+
+    if USE_GEMINI_TRANSLATION and GEMINI_API_KEY:
+        return translate_srt_with_gemini(source_srt)
+
+    logger.warning(
+        "Gemini translation is unavailable; using basic Google translation. "
+        "For natural Khmer and reliable speaker labels, set GEMINI_API_KEY."
+    )
     source_cues = parse_plain_srt(source_srt)
     blocks: list[str] = []
     previous_tag = "M_ADULT"
 
-    for index, timestamp, source_text in source_cues:
+    for index, timestamp, source_text, source_tag, source_emotion in source_cues:
         khmer_text = translate_text_free(source_text)
         khmer_text = re.sub(r"[\u3400-\u4DBF\u4E00-\u9FFF]+", "", khmer_text).strip()
         if not khmer_text:
             raise RuntimeError(f"Cue {index} could not be translated to Khmer")
-        tag = infer_voice_tag(source_text, previous_tag)
-        emotion = infer_emotion(source_text)
+        tag = source_tag or infer_voice_tag(source_text, previous_tag)
+        emotion = source_emotion or infer_emotion(source_text)
         previous_tag = tag
-        blocks.append(f"{index}\n{timestamp}\n[{tag}][{emotion}] {khmer_text}")
+        short_tag = {
+            "M_ADULT": "M",
+            "F_ADULT": "F",
+        }.get(tag, tag)
+        blocks.append(f"{index}\n{timestamp}\n[{short_tag}][{emotion}] {khmer_text}")
 
     result = "\n\n".join(blocks) + "\n"
     if srt_signature(result) != expected_signature:
@@ -609,7 +735,6 @@ def translate_to_khmer_srt(source_srt: str) -> str:
         raise RuntimeError("Chinese characters remained in Khmer SRT")
     parse_tagged_srt(result)
     return result
-
 
 def _clean_dialogue_text(text: str) -> str:
     """Remove labels/markup that Edge-TTS might pronounce aloud."""
