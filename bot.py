@@ -179,6 +179,32 @@ VOICE_PROFILES = {
 }
 VALID_TAGS = set(VOICE_PROFILES)
 
+# Accept the short labels commonly used in SRT files and map them to the
+# exact Khmer Edge-TTS voices.  This prevents every unknown label from
+# silently falling back to the male voice.
+VOICE_TAG_ALIASES = {
+    "M": "M_ADULT",
+    "MALE": "M_ADULT",
+    "MAN": "M_ADULT",
+    "PISETH": "M_ADULT",
+    "M_ADULT": "M_ADULT",
+    "M_YOUNG": "M_YOUNG",
+    "M_OLD": "M_OLD",
+    "M_THINK": "M_THINK",
+    "NARRATOR_M": "NARRATOR_M",
+    "F": "F_ADULT",
+    "FEMALE": "F_ADULT",
+    "WOMAN": "F_ADULT",
+    "SREYMOM": "F_ADULT",
+    "F_ADULT": "F_ADULT",
+    "F_YOUNG": "F_YOUNG",
+    "F_OLD": "F_OLD",
+    "F_THINK": "F_THINK",
+    "NARRATOR_F": "NARRATOR_F",
+    "BOY": "BOY",
+    "GIRL": "GIRL",
+}
+
 EMOTION_ADJUSTMENTS = {
     "NEUTRAL": {"rate": 0, "pitch": 0, "volume": 0},
     "HAPPY": {"rate": 5, "pitch": 3, "volume": 1},
@@ -585,7 +611,31 @@ def translate_to_khmer_srt(source_srt: str) -> str:
     return result
 
 
+def _clean_dialogue_text(text: str) -> str:
+    """Remove labels/markup that Edge-TTS might pronounce aloud."""
+    text = text.replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _voice_tag_from_dubbing_voice(voice_name: str) -> str:
+    name = voice_name.strip().lower()
+    if "sreymom" in name:
+        return "F_ADULT"
+    if "piseth" in name:
+        return "M_ADULT"
+    raise ValueError(f"Unsupported dubbing voice: {voice_name!r}")
+
+
 def parse_tagged_srt(srt_text: str) -> list[SubtitleCue]:
+    """Parse SRT with either bracket labels or <dubbing voice=...> labels.
+
+    Supported examples:
+      [F][SAD] text
+      [M_ADULT][NEUTRAL] text
+      <dubbing voice="km-KH-SreymomNeural">text</dubbing>
+    """
     cues: list[SubtitleCue] = []
 
     for block in split_srt_blocks(srt_text):
@@ -603,23 +653,42 @@ def parse_tagged_srt(srt_text: str) -> list[SubtitleCue]:
             raise ValueError(f"Invalid timestamp for cue {index}: {lines[1]!r}")
 
         dialogue = " ".join(lines[2:]).strip()
-        tag_match = re.fullmatch(
-            r"\[([A-Z_]+)\]\[([A-Z_]+)\]\s*(.+)",
-            dialogue,
-            flags=re.S,
-        )
-        if not tag_match:
-            raise ValueError(
-                f"Cue {index} is missing a valid [VOICE][EMOTION] prefix"
-            )
+        tag = ""
+        emotion = "NEUTRAL"
+        text = ""
 
-        tag, emotion, text = tag_match.groups()
+        xml_match = re.fullmatch(
+            r'<dubbing\s+voice=["\']([^"\']+)["\']\s*>(.*?)</dubbing>',
+            dialogue,
+            flags=re.I | re.S,
+        )
+        if xml_match:
+            tag = _voice_tag_from_dubbing_voice(xml_match.group(1))
+            text = xml_match.group(2)
+        else:
+            # Emotion is optional. A single [F] or [M] label is valid.
+            bracket_match = re.fullmatch(
+                r"\[([^\]]+)\](?:\[([^\]]+)\])?\s*(.+)",
+                dialogue,
+                flags=re.S,
+            )
+            if not bracket_match:
+                raise ValueError(
+                    f"Cue {index} needs [M]/[F], [VOICE][EMOTION], "
+                    "or a <dubbing voice=...> label"
+                )
+            raw_tag, raw_emotion, text = bracket_match.groups()
+            normalized_tag = re.sub(r"[^A-Z0-9_]", "", raw_tag.upper())
+            tag = VOICE_TAG_ALIASES.get(normalized_tag, normalized_tag)
+            if raw_emotion:
+                emotion = re.sub(r"[^A-Z0-9_]", "", raw_emotion.upper())
+
         if tag not in VALID_TAGS:
             raise ValueError(f"Unsupported voice tag [{tag}] at cue {index}")
         if emotion not in VALID_EMOTIONS:
             raise ValueError(f"Unsupported emotion [{emotion}] at cue {index}")
 
-        text = re.sub(r"<[^>]+>", "", text).strip()
+        text = _clean_dialogue_text(text)
         if not text:
             raise ValueError(f"Cue {index} has empty dialogue")
 
@@ -628,16 +697,7 @@ def parse_tagged_srt(srt_text: str) -> list[SubtitleCue]:
         if end <= start:
             raise ValueError(f"Cue {index} has end time <= start time")
 
-        cues.append(
-            SubtitleCue(
-                index=index,
-                start=start,
-                end=end,
-                tag=tag,
-                emotion=emotion,
-                text=text,
-            )
-        )
+        cues.append(SubtitleCue(index, start, end, tag, emotion, text))
 
     return sorted(cues, key=lambda cue: (cue.start, cue.index))
 
@@ -850,6 +910,7 @@ def build_atempo_filter(speed: float) -> str:
 async def prepare_cue_audio(
     position: int,
     cue: SubtitleCue,
+    available_duration: float,
     workdir: Path,
     semaphore: asyncio.Semaphore,
 ) -> tuple[int, Path, int, float]:
@@ -860,7 +921,7 @@ async def prepare_cue_audio(
         await synthesize_with_retry(cue, raw_path)
 
     raw_duration = await asyncio.to_thread(ffprobe_duration, raw_path)
-    target_duration = max(0.25, cue.end - cue.start)
+    target_duration = max(0.35, available_duration)
     requested_speed = raw_duration / target_duration
     speed = max(MIN_SPEED, min(MAX_SPEED, requested_speed))
 
@@ -905,13 +966,18 @@ async def create_timed_dub_mp3(
         raise RuntimeError("No subtitle cues were provided for TTS")
 
     semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
-    tasks = [
-        asyncio.create_task(
-            prepare_cue_audio(i, cue, workdir, semaphore),
-            name=f"tts-cue-{cue.index}",
+    tasks = []
+    for i, cue in enumerate(cues, start=1):
+        # Prefer the real gap before the next subtitle. This keeps complete
+        # syllables while reducing overlaps between consecutive speakers.
+        next_start = cues[i].start if i < len(cues) else cue.end
+        available = max(0.35, max(cue.end, next_start - 0.04) - cue.start)
+        tasks.append(
+            asyncio.create_task(
+                prepare_cue_audio(i, cue, available, workdir, semaphore),
+                name=f"tts-cue-{cue.index}",
+            )
         )
-        for i, cue in enumerate(cues, start=1)
-    ]
 
     results: list[tuple[int, Path, int, float]] = []
     try:
@@ -942,17 +1008,29 @@ async def create_timed_dub_mp3(
 
     filter_parts: list[str] = []
     labels: list[str] = []
-    for input_index, (_position, _path, delay_ms, _duration) in enumerate(results):
+    adjusted_results: list[tuple[int, Path, int, float]] = []
+    previous_end = 0.0
+    minimum_gap = 0.025
+    for item, cue in zip(results, cues):
+        position, path, original_delay_ms, fitted_duration = item
+        original_start = original_delay_ms / 1000.0
+        # If TTS is still longer than its subtitle slot, move the next line
+        # forward instead of mixing two voices on top of each other.
+        effective_start = max(original_start, previous_end + minimum_gap)
+        adjusted_results.append(
+            (position, path, round(effective_start * 1000), fitted_duration)
+        )
+        previous_end = effective_start + fitted_duration
+
+    for input_index, (_position, _path, delay_ms, _duration) in enumerate(adjusted_results):
         label = f"a{input_index}"
         filter_parts.append(
             f"[{input_index}:a]adelay={delay_ms}:all=1[{label}]"
         )
         labels.append(f"[{label}]")
 
-    total_duration = max(
-        cue.end for cue in cues
-    )
-    for (_position, _path, delay_ms, fitted_duration) in results:
+    total_duration = max(cue.end for cue in cues)
+    for (_position, _path, delay_ms, fitted_duration) in adjusted_results:
         total_duration = max(total_duration, delay_ms / 1000 + fitted_duration)
     total_duration += 0.20
 
