@@ -14,7 +14,8 @@ from typing import Awaitable, Callable, Optional
 
 import edge_tts
 from faster_whisper import WhisperModel
-from google import genai
+import torch
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from telegram import Message, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
@@ -70,9 +71,17 @@ def env_bool(name: str, default: bool) -> bool:
 
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+LOCAL_TRANSLATION_MODEL = os.getenv(
+    "LOCAL_TRANSLATION_MODEL",
+    "facebook/nllb-200-distilled-600M",
+).strip()
+TRANSLATION_DEVICE = os.getenv(
+    "TRANSLATION_DEVICE",
+    "cuda" if torch.cuda.is_available() else "cpu",
+).strip()
+TRANSLATION_BATCH_SIZE = env_int("TRANSLATION_BATCH_SIZE", 4, 1)
+TRANSLATION_MAX_INPUT_TOKENS = env_int("TRANSLATION_MAX_INPUT_TOKENS", 256, 32)
+TRANSLATION_MAX_NEW_TOKENS = env_int("TRANSLATION_MAX_NEW_TOKENS", 256, 32)
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base").strip()
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu").strip()
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8").strip()
@@ -88,7 +97,9 @@ DELETE_OUTPUT_MESSAGES = env_bool("DELETE_OUTPUT_MESSAGES", True)
 MAX_TTS_RETRIES = env_int("MAX_TTS_RETRIES", 3, 1)
 TRANSLATION_RETRIES = env_int("TRANSLATION_RETRIES", 3, 1)
 TTS_TIMEOUT_SECONDS = env_int("TTS_TIMEOUT_SECONDS", 90, 5)
-GEMINI_TIMEOUT_SECONDS = env_int("GEMINI_TIMEOUT_SECONDS", 180, 10)
+LOCAL_TRANSLATION_TIMEOUT_SECONDS = env_int(
+    "LOCAL_TRANSLATION_TIMEOUT_SECONDS", 900, 30
+)
 SUBPROCESS_TIMEOUT_SECONDS = env_int("SUBPROCESS_TIMEOUT_SECONDS", 300, 10)
 TTS_CONCURRENCY = env_int("TTS_CONCURRENCY", 4, 1)
 UPDATE_CONCURRENCY = env_int("UPDATE_CONCURRENCY", 8, 1)
@@ -158,7 +169,9 @@ sessions: dict[int, ChatSession] = {}
 
 _whisper_model: WhisperModel | None = None
 _whisper_lock = asyncio.Lock()
-gemini_client: genai.Client | None = None
+_translation_tokenizer = None
+_translation_model = None
+_translation_lock = asyncio.Lock()
 
 
 VOICE_PROFILES = {
@@ -199,8 +212,6 @@ def validate_runtime() -> None:
     missing = []
     if not TELEGRAM_BOT_TOKEN:
         missing.append("TELEGRAM_BOT_TOKEN")
-    if not GEMINI_API_KEY:
-        missing.append("GEMINI_API_KEY")
     if missing:
         raise RuntimeError(
             "Missing required environment variables: " + ", ".join(missing)
@@ -215,8 +226,9 @@ def validate_runtime() -> None:
 
 
 def initialize_clients() -> None:
-    global gemini_client
-    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    # Translation model is loaded lazily on the first job. This keeps startup
+    # fast and avoids downloading the model until it is actually needed.
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -450,120 +462,146 @@ def srt_signature(text: str) -> list[tuple[int, str]]:
     return signature
 
 
-def clean_gemini_output(text: str) -> str:
-    text = text.strip()
-    text = re.sub(r"^```(?:srt|text)?\s*", "", text, flags=re.I)
-    text = re.sub(r"\s*```$", "", text)
-    return text.strip()
-
-
 def contains_chinese(text: str) -> bool:
     return bool(re.search(r"[\u3400-\u4DBF\u4E00-\u9FFF]", text))
 
 
-def translation_prompt() -> str:
-    return """
-You are KhmerDubAI, a professional Chinese-to-Khmer movie subtitle and
-dubbing translator.
+def get_translation_components():
+    """Load the free local NLLB model once and reuse it for all jobs."""
+    global _translation_tokenizer, _translation_model
 
-Return ONLY valid SRT.
+    if _translation_tokenizer is None or _translation_model is None:
+        logger.info(
+            "Loading local translation model=%s device=%s",
+            LOCAL_TRANSLATION_MODEL,
+            TRANSLATION_DEVICE,
+        )
+        _translation_tokenizer = AutoTokenizer.from_pretrained(
+            LOCAL_TRANSLATION_MODEL,
+            src_lang="zho_Hans",
+        )
+        dtype = torch.float16 if TRANSLATION_DEVICE.startswith("cuda") else torch.float32
+        _translation_model = AutoModelForSeq2SeqLM.from_pretrained(
+            LOCAL_TRANSLATION_MODEL,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+        )
+        _translation_model.to(TRANSLATION_DEVICE)
+        _translation_model.eval()
 
-STRICT RULES:
-1. Preserve every subtitle index and timestamp exactly.
-2. Preserve the exact number and order of blocks.
-3. Never merge, split, omit, duplicate, reorder, or invent dialogue.
-4. Remove all Chinese characters from the output.
-5. Translate into natural Cambodian spoken Khmer suitable for dubbing.
-6. Preserve meaning, humor, status, relationships, emotion, and continuity.
-7. Keep lines concise enough for their timestamps.
-8. Each dialogue line must begin with exactly one voice tag and one emotion tag.
-
-VOICE TAGS:
-[M_YOUNG] [F_YOUNG] [M_ADULT] [F_ADULT]
-[M_OLD] [F_OLD] [BOY] [GIRL]
-[M_THINK] [F_THINK] [NARRATOR_M] [NARRATOR_F]
-
-EMOTION TAGS:
-[NEUTRAL] [HAPPY] [SAD] [ANGRY] [FEAR]
-[LOVE] [SARCASM] [CRYING] [THINKING]
-
-Use the same voice tag for the same nearby speaker. Use adult when age is
-uncertain. Use thinking tags only for inner monologue and narrator tags only
-for narration.
-
-Example:
-1
-00:00:01,000 --> 00:00:03,000
-[M_ADULT][ANGRY] ឯងហ៊ានធ្វើបែបនេះមែនទេ!
-""".strip()
+    return _translation_tokenizer, _translation_model
 
 
-def retry_delay_from_error(exc: Exception, attempt: int) -> float:
-    text = str(exc)
-    match = re.search(
-        r"(?:retry in|retry after)\s+(\d+(?:\.\d+)?)\s*s",
-        text,
-        flags=re.I,
+def infer_emotion(source_text: str) -> str:
+    text = source_text.strip()
+    if any(mark in text for mark in ("!", "！", "滚", "住手", "混蛋", "该死")):
+        return "ANGRY"
+    if any(mark in text for mark in ("?", "？", "怎么", "为什么", "什么")):
+        return "NEUTRAL"
+    if any(mark in text for mark in ("哭", "死", "对不起", "难过", "伤心")):
+        return "SAD"
+    if any(mark in text for mark in ("怕", "救命", "危险", "不要过来")):
+        return "FEAR"
+    if any(mark in text for mark in ("爱", "喜欢", "想你", "亲爱的")):
+        return "LOVE"
+    if any(mark in text for mark in ("哈哈", "呵呵", "太好了")):
+        return "HAPPY"
+    return "NEUTRAL"
+
+
+def infer_voice_tag(source_text: str, previous_tag: str) -> str:
+    """Best-effort offline speaker tag selection.
+
+    A translation model cannot identify actors from audio. We keep the nearby
+    speaker stable and use obvious Chinese wording only when it gives a clue.
+    """
+    text = source_text.strip()
+    if any(word in text for word in ("旁白", "解说", "画外音")):
+        return "NARRATOR_M"
+    if any(word in text for word in ("娘", "姐姐", "妹妹", "小姐", "夫人", "奶奶")):
+        return "F_ADULT"
+    if any(word in text for word in ("爹", "哥哥", "弟弟", "公子", "大人", "爷爷")):
+        return "M_ADULT"
+    return previous_tag or "M_ADULT"
+
+
+def parse_plain_srt(source_srt: str) -> list[tuple[int, str, str]]:
+    cues: list[tuple[int, str, str]] = []
+    for block in split_srt_blocks(source_srt):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if len(lines) < 3:
+            raise ValueError(f"Invalid subtitle block: {block[:120]!r}")
+        index = int(lines[0])
+        timestamp = re.sub(r"\s+", " ", lines[1]).replace(".", ",")
+        text = " ".join(lines[2:]).strip()
+        text = re.sub(r"^\[[A-Z_]+\]\[[A-Z_]+\]\s*", "", text)
+        if not text:
+            raise ValueError(f"Cue {index} has empty dialogue")
+        cues.append((index, timestamp, text))
+    return cues
+
+
+def translate_text_batch(texts: list[str]) -> list[str]:
+    tokenizer, model = get_translation_components()
+    tokenizer.src_lang = "zho_Hans"
+
+    encoded = tokenizer(
+        texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=TRANSLATION_MAX_INPUT_TOKENS,
     )
-    if match:
-        return min(60.0, max(1.0, float(match.group(1)) + 0.5))
-    return min(20.0, 2.0 ** (attempt - 1))
+    encoded = {key: value.to(TRANSLATION_DEVICE) for key, value in encoded.items()}
+
+    with torch.inference_mode():
+        generated = model.generate(
+            **encoded,
+            forced_bos_token_id=tokenizer.convert_tokens_to_ids("khm_Khmr"),
+            max_new_tokens=TRANSLATION_MAX_NEW_TOKENS,
+            num_beams=3,
+            repetition_penalty=1.08,
+            no_repeat_ngram_size=3,
+        )
+
+    results = tokenizer.batch_decode(generated, skip_special_tokens=True)
+    return [re.sub(r"\s+", " ", item).strip() for item in results]
 
 
 def translate_to_khmer_srt(source_srt: str) -> str:
-    if gemini_client is None:
-        raise RuntimeError("Gemini client is not initialized")
-
+    """Translate Chinese SRT to Khmer locally without any paid API key."""
     expected_signature = srt_signature(source_srt)
-    last_error: Exception | None = None
+    source_cues = parse_plain_srt(source_srt)
+    translated: list[str] = []
 
-    for attempt in range(1, TRANSLATION_RETRIES + 1):
-        try:
-            response = gemini_client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=(
-                    f"{translation_prompt()}\n\n"
-                    f"EXPECTED_BLOCK_COUNT: {len(expected_signature)}\n\n"
-                    f"INPUT SRT:\n{source_srt}"
-                ),
-            )
-            response_text = getattr(response, "text", None)
-            if not response_text:
-                raise RuntimeError("Gemini returned an empty response")
+    for offset in range(0, len(source_cues), TRANSLATION_BATCH_SIZE):
+        batch = source_cues[offset : offset + TRANSLATION_BATCH_SIZE]
+        batch_texts = [cue[2] for cue in batch]
+        translated.extend(translate_text_batch(batch_texts))
 
-            result = clean_gemini_output(response_text)
-            actual_signature = srt_signature(result)
+    if len(translated) != len(source_cues):
+        raise RuntimeError("Local translator returned the wrong number of subtitles")
 
-            if actual_signature != expected_signature:
-                raise RuntimeError(
-                    "Gemini changed subtitle numbering or timestamps"
-                )
-            if contains_chinese(result):
-                raise RuntimeError("Chinese characters remained in Khmer SRT")
+    blocks: list[str] = []
+    previous_tag = "M_ADULT"
+    for (index, timestamp, source_text), khmer_text in zip(source_cues, translated):
+        khmer_text = re.sub(r"[\u3400-\u4DBF\u4E00-\u9FFF]+", "", khmer_text).strip()
+        if not khmer_text:
+            khmer_text = "…"
+        tag = infer_voice_tag(source_text, previous_tag)
+        emotion = infer_emotion(source_text)
+        previous_tag = tag
+        blocks.append(
+            f"{index}\n{timestamp}\n[{tag}][{emotion}] {khmer_text}"
+        )
 
-            # Validate every translated cue before accepting the response.
-            parsed = parse_tagged_srt(result)
-            if len(parsed) != len(expected_signature):
-                raise RuntimeError(
-                    f"Parsed cue mismatch: expected {len(expected_signature)}, "
-                    f"got {len(parsed)}"
-                )
-            return result + "\n"
-
-        except Exception as exc:
-            last_error = exc
-            logger.warning(
-                "Translation attempt %s/%s failed: %s",
-                attempt,
-                TRANSLATION_RETRIES,
-                exc,
-            )
-            if attempt < TRANSLATION_RETRIES:
-                time.sleep(retry_delay_from_error(exc, attempt))
-
-    raise RuntimeError(
-        f"Translation failed after {TRANSLATION_RETRIES} attempts: {last_error}"
-    )
+    result = "\n\n".join(blocks) + "\n"
+    if srt_signature(result) != expected_signature:
+        raise RuntimeError("Local translation changed subtitle numbering or timestamps")
+    if contains_chinese(result):
+        raise RuntimeError("Chinese characters remained in Khmer SRT")
+    parse_tagged_srt(result)
+    return result
 
 
 def parse_tagged_srt(srt_text: str) -> list[SubtitleCue]:
@@ -1074,7 +1112,7 @@ async def process_source(
 
         khmer_srt = await asyncio.wait_for(
             asyncio.to_thread(translate_to_khmer_srt, source_srt),
-            timeout=GEMINI_TIMEOUT_SECONDS,
+            timeout=LOCAL_TRANSLATION_TIMEOUT_SECONDS,
         )
 
         srt_path = tmpdir / "khmer_dub.srt"
@@ -1204,10 +1242,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     session.last_activity = time.monotonic()
 
     reply = await message.reply_text(
-        "🤖 KhmerDubAI Turbo Server\n\n"
+        "🤖 KhmerDubAI Free Offline Translator\n\n"
         "ចុច «🆕 ធ្វើថ្មី» រួចផ្ញើវីដេអូ សំឡេង ឬ SRT រឿងចិន។\n\n"
         f"⏱ កំណត់៖ {MAX_MEDIA_SECONDS // 60} នាទី ឬតិចជាងនេះ\n"
         "🎭 បែងចែកប្រុស ស្រី ក្មេង មនុស្សចាស់ និងសំឡេងគិត\n"
+        "🆓 មិនត្រូវការ Gemini API Key\n"
         "📦 លទ្ធផល៖ khmer_dub.srt និង khmer_dub.mp3",
         reply_markup=PROJECT_KEYBOARD,
     )
@@ -1426,11 +1465,6 @@ async def post_shutdown(application: Application) -> None:
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
 
-    if gemini_client is not None:
-        try:
-            gemini_client.close()
-        except Exception:
-            logger.debug("Gemini client close ignored", exc_info=True)
 
 
 def main() -> None:
