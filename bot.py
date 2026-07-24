@@ -17,7 +17,6 @@ from typing import Awaitable, Callable, Optional
 
 import edge_tts
 from faster_whisper import WhisperModel
-from deep_translator import GoogleTranslator
 from telegram import Message, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
@@ -73,17 +72,15 @@ def env_bool(name: str, default: bool) -> bool:
 
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TRANSLATION_SOURCE = os.getenv("TRANSLATION_SOURCE", "zh-CN").strip()
-TRANSLATION_TARGET = os.getenv("TRANSLATION_TARGET", "km").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-GEMINI_API_BASE = os.getenv(
-    "GEMINI_API_BASE",
-    "https://generativelanguage.googleapis.com/v1beta",
-).rstrip("/")
-USE_GEMINI_TRANSLATION = env_bool("USE_GEMINI_TRANSLATION", True)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+GROQ_API_BASE = os.getenv("GROQ_API_BASE", "https://api.groq.com/openai/v1").rstrip("/")
 TRANSLATION_DELAY_SECONDS = env_float("TRANSLATION_DELAY_SECONDS", 0.15, 0.0)
-TRANSLATION_MAX_CHARS = env_int("TRANSLATION_MAX_CHARS", 3000, 100)
+TRANSLATION_MAX_CHARS = env_int("TRANSLATION_MAX_CHARS", 12000, 100)
+USER_LIMIT = env_int("USER_LIMIT", 100, 1)
+JOB_CONCURRENCY = env_int("JOB_CONCURRENCY", 3, 1)
+USER_REGISTRY_PATH = Path(os.getenv("USER_REGISTRY_PATH", "/data/allowed_users.json"))
+
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base").strip()
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu").strip()
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8").strip()
@@ -168,6 +165,10 @@ class ChatSession:
 
 
 sessions: dict[int, ChatSession] = {}
+_user_registry_lock = asyncio.Lock()
+_job_semaphore = asyncio.Semaphore(JOB_CONCURRENCY)
+_active_jobs = 0
+_active_jobs_lock = asyncio.Lock()
 
 _whisper_model: WhisperModel | None = None
 _whisper_lock = asyncio.Lock()
@@ -237,6 +238,8 @@ def validate_runtime() -> None:
     missing = []
     if not TELEGRAM_BOT_TOKEN:
         missing.append("TELEGRAM_BOT_TOKEN")
+    if not GROQ_API_KEY:
+        missing.append("GROQ_API_KEY")
     if missing:
         raise RuntimeError(
             "Missing required environment variables: " + ", ".join(missing)
@@ -254,6 +257,48 @@ def initialize_clients() -> None:
     # Translation model is loaded lazily on the first job. This keeps startup
     # fast and avoids downloading the model until it is actually needed.
     return None
+
+
+# ---------------------------------------------------------------------------
+# User admission and privacy
+# ---------------------------------------------------------------------------
+
+def _load_allowed_users() -> set[int]:
+    try:
+        if not USER_REGISTRY_PATH.exists():
+            return set()
+        data = json.loads(USER_REGISTRY_PATH.read_text(encoding="utf-8"))
+        return {int(value) for value in data if str(value).lstrip("-").isdigit()}
+    except Exception:
+        logger.exception("Could not read user registry")
+        return set()
+
+
+def _save_allowed_users(users: set[int]) -> None:
+    USER_REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = USER_REGISTRY_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(sorted(users)), encoding="utf-8")
+    tmp.replace(USER_REGISTRY_PATH)
+
+
+async def admit_user(update: Update) -> bool:
+    user = update.effective_user
+    message = update.effective_message
+    if user is None or message is None:
+        return False
+    async with _user_registry_lock:
+        allowed = await asyncio.to_thread(_load_allowed_users)
+        if user.id in allowed:
+            return True
+        if len(allowed) >= USER_LIMIT:
+            await message.reply_text(
+                f"⛔ Bot នេះបានគ្រប់ចំនួនអ្នកប្រើ {USER_LIMIT} នាក់ហើយ។"
+            )
+            return False
+        allowed.add(user.id)
+        await asyncio.to_thread(_save_allowed_users, allowed)
+        logger.info("Admitted Telegram user %s (%s/%s)", user.id, len(allowed), USER_LIMIT)
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +426,9 @@ async def require_project(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> bool:
     if update.effective_chat is None or update.effective_message is None:
+        return False
+
+    if not await admit_user(update):
         return False
 
     chat_id = update.effective_chat.id
@@ -580,52 +628,48 @@ Critical rules:
 """.strip()
 
 
-def _gemini_generate(prompt: str) -> str:
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY is missing")
-    url = f"{GEMINI_API_BASE}/models/{GEMINI_MODEL}:generateContent"
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.25,
-            "topP": 0.9,
-            "responseMimeType": "text/plain",
-        },
-    }
+def _groq_generate(prompt: str) -> str:
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is missing")
     response = requests.post(
-        url,
-        params={"key": GEMINI_API_KEY},
-        json=payload,
+        f"{GROQ_API_BASE}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": GROQ_MODEL,
+            "temperature": 0.2,
+            "messages": [
+                {"role": "system", "content": KHMER_TRANSLATION_PROMPT},
+                {"role": "user", "content": "Translate and validate this SRT:\n\n" + normalize_srt(prompt)},
+            ],
+        },
         timeout=TRANSLATION_TIMEOUT_SECONDS,
     )
+    if response.status_code == 429:
+        retry_after = response.headers.get("retry-after", "a short time")
+        raise RuntimeError(f"AI service rate limit reached; retry after {retry_after}")
     if response.status_code >= 400:
-        detail = response.text[:500]
-        raise RuntimeError(
-            f"Gemini translation HTTP {response.status_code}: {detail}"
-        )
+        raise RuntimeError(f"Groq translation HTTP {response.status_code}: {response.text[:300]}")
     data = response.json()
-    candidates = data.get("candidates") or []
-    if not candidates:
-        raise RuntimeError("Gemini returned no translation candidate")
-    parts = candidates[0].get("content", {}).get("parts", [])
-    text = "".join(str(part.get("text", "")) for part in parts).strip()
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError("Groq returned no translation")
+    text = str(choices[0].get("message", {}).get("content", "")).strip()
     text = re.sub(r"^```(?:srt)?\s*|\s*```$", "", text, flags=re.I | re.S).strip()
     if not text:
-        raise RuntimeError("Gemini returned empty translation text")
+        raise RuntimeError("Groq returned empty translation")
     return text
 
 
-def translate_srt_with_gemini(source_srt: str) -> str:
+def translate_to_khmer_srt(source_srt: str) -> str:
+    """Context-aware Khmer translation with strict SRT and voice-label validation."""
     expected = srt_signature(source_srt)
-    prompt = (
-        KHMER_TRANSLATION_PROMPT
-        + "\n\nSOURCE SRT:\n"
-        + normalize_srt(source_srt).strip()
-    )
     last_error: Exception | None = None
     for attempt in range(1, TRANSLATION_RETRIES + 1):
         try:
-            result = _gemini_generate(prompt)
+            result = _groq_generate(source_srt)
             if srt_signature(result) != expected:
                 raise RuntimeError("AI changed subtitle numbering or timestamps")
             if contains_chinese(result):
@@ -634,107 +678,11 @@ def translate_srt_with_gemini(source_srt: str) -> str:
             return normalize_srt(result).strip() + "\n"
         except Exception as exc:
             last_error = exc
+            logger.warning("Translation attempt %s/%s failed: %s", attempt, TRANSLATION_RETRIES, exc)
             if attempt < TRANSLATION_RETRIES:
-                time.sleep(min(2 ** attempt, 10))
-    raise RuntimeError(f"Gemini translation failed: {last_error}")
+                time.sleep(min(2 ** attempt, 12))
+    raise RuntimeError(f"Translation failed: {last_error}")
 
-def _split_translation_text(text: str, limit: int) -> list[str]:
-    """Split long text without breaking ordinary short subtitle lines."""
-    text = re.sub(r"\s+", " ", text).strip()
-    if len(text) <= limit:
-        return [text]
-    pieces = re.split(r"(?<=[。！？!?；;，,])", text)
-    chunks: list[str] = []
-    current = ""
-    for piece in pieces:
-        piece = piece.strip()
-        if not piece:
-            continue
-        if current and len(current) + 1 + len(piece) > limit:
-            chunks.append(current)
-            current = piece
-        else:
-            current = f"{current} {piece}".strip()
-    if current:
-        chunks.append(current)
-    return chunks or [text[:limit]]
-
-
-def translate_text_free(text: str) -> str:
-    """Translate one Chinese subtitle to Khmer with no API key.
-
-    This uses Google Translate's public web endpoint through deep-translator.
-    It is lightweight and avoids loading the multi-gigabyte NLLB/Torch model.
-    """
-    last_error: Exception | None = None
-    chunks = _split_translation_text(text, TRANSLATION_MAX_CHARS)
-    translated_chunks: list[str] = []
-
-    for chunk in chunks:
-        for attempt in range(1, TRANSLATION_RETRIES + 1):
-            try:
-                result = GoogleTranslator(
-                    source=TRANSLATION_SOURCE,
-                    target=TRANSLATION_TARGET,
-                ).translate(chunk)
-                result = re.sub(r"\s+", " ", result or "").strip()
-                if not result:
-                    raise RuntimeError("translation service returned empty text")
-                translated_chunks.append(result)
-                if TRANSLATION_DELAY_SECONDS:
-                    time.sleep(TRANSLATION_DELAY_SECONDS)
-                break
-            except Exception as exc:
-                last_error = exc
-                if attempt >= TRANSLATION_RETRIES:
-                    raise RuntimeError(
-                        "Free translation service failed after "
-                        f"{TRANSLATION_RETRIES} attempts: {exc}"
-                    ) from exc
-                time.sleep(min(2 ** attempt, 8))
-
-    result = " ".join(translated_chunks).strip()
-    if not result and last_error:
-        raise RuntimeError(str(last_error))
-    return result
-
-
-def translate_to_khmer_srt(source_srt: str) -> str:
-    """Translate, label, validate, then return dubbing-ready Khmer SRT."""
-    expected_signature = srt_signature(source_srt)
-
-    if USE_GEMINI_TRANSLATION and GEMINI_API_KEY:
-        return translate_srt_with_gemini(source_srt)
-
-    logger.warning(
-        "Gemini translation is unavailable; using basic Google translation. "
-        "For natural Khmer and reliable speaker labels, set GEMINI_API_KEY."
-    )
-    source_cues = parse_plain_srt(source_srt)
-    blocks: list[str] = []
-    previous_tag = "M_ADULT"
-
-    for index, timestamp, source_text, source_tag, source_emotion in source_cues:
-        khmer_text = translate_text_free(source_text)
-        khmer_text = re.sub(r"[\u3400-\u4DBF\u4E00-\u9FFF]+", "", khmer_text).strip()
-        if not khmer_text:
-            raise RuntimeError(f"Cue {index} could not be translated to Khmer")
-        tag = source_tag or infer_voice_tag(source_text, previous_tag)
-        emotion = source_emotion or infer_emotion(source_text)
-        previous_tag = tag
-        short_tag = {
-            "M_ADULT": "M",
-            "F_ADULT": "F",
-        }.get(tag, tag)
-        blocks.append(f"{index}\n{timestamp}\n[{short_tag}][{emotion}] {khmer_text}")
-
-    result = "\n\n".join(blocks) + "\n"
-    if srt_signature(result) != expected_signature:
-        raise RuntimeError("Translation changed subtitle numbering or timestamps")
-    if contains_chinese(result):
-        raise RuntimeError("Chinese characters remained in Khmer SRT")
-    parse_tagged_srt(result)
-    return result
 
 def _clean_dialogue_text(text: str) -> str:
     """Remove labels/markup that Edge-TTS might pronounce aloud."""
@@ -1399,23 +1347,32 @@ async def run_downloaded_job(
             track_message(reply)
             return
 
-        with tempfile.TemporaryDirectory(prefix="khmerdubai_") as tmp:
-            tmpdir = Path(tmp)
-            source_path = tmpdir / safe_filename(filename, "upload.bin")
-
-            telegram_file = await telegram_media.get_file()
-            await telegram_file.download_to_drive(custom_path=source_path)
-
-            if not is_srt:
-                await asyncio.to_thread(validate_media_duration, source_path)
-
-            await process_source(
-                update,
-                context,
-                source_path,
-                tmpdir,
-                is_srt=is_srt,
+        waiting = None
+        if _job_semaphore.locked():
+            waiting = await message.reply_text(
+                "🕒 Server កំពុងរវល់។ ការងាររបស់អ្នកបានចូលជួររង់ចាំ ហើយដំណើរការដាច់ដោយឡែកពីអ្នកដទៃ។"
             )
+            track_message(waiting)
+        async with _job_semaphore:
+            if waiting is not None:
+                schedule_delete(waiting)
+            with tempfile.TemporaryDirectory(prefix=f"khmerdubai_{chat.id}_") as tmp:
+                tmpdir = Path(tmp)
+                source_path = tmpdir / safe_filename(filename, "upload.bin")
+
+                telegram_file = await telegram_media.get_file()
+                await telegram_file.download_to_drive(custom_path=source_path)
+
+                if not is_srt:
+                    await asyncio.to_thread(validate_media_duration, source_path)
+
+                await process_source(
+                    update,
+                    context,
+                    source_path,
+                    tmpdir,
+                    is_srt=is_srt,
+                )
 
     except asyncio.CancelledError:
         notice = await message.reply_text(
@@ -1448,6 +1405,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if chat is None or message is None:
         return
+    if not await admit_user(update):
+        return
 
     session = get_session(chat.id)
     if session.expiry_task and not session.expiry_task.done():
@@ -1458,11 +1417,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     session.last_activity = time.monotonic()
 
     reply = await message.reply_text(
-        "🤖 KhmerDubAI Free Offline Translator\n\n"
+        "🤖 KhmerDubAI Server Edition\n\n"
         "ចុច «🆕 ធ្វើថ្មី» រួចផ្ញើវីដេអូ សំឡេង ឬ SRT រឿងចិន។\n\n"
         f"⏱ កំណត់៖ {MAX_MEDIA_SECONDS // 60} នាទី ឬតិចជាងនេះ\n"
         "🎭 បែងចែកប្រុស ស្រី ក្មេង មនុស្សចាស់ និងសំឡេងគិត\n"
-        "🆓 មិនត្រូវការ Gemini API Key ឬម៉ូដែល NLLB ធំៗ\n"
+        "☁️ ការងាររត់លើ Server មិនប្រើកម្លាំងទូរសព្ទរបស់អ្នក\n"
         "📦 លទ្ធផល៖ khmer_dub.srt និង khmer_dub.mp3",
         reply_markup=PROJECT_KEYBOARD,
     )
@@ -1495,6 +1454,9 @@ async def new_project(
     chat = update.effective_chat
     message = update.effective_message
     if chat is None or message is None:
+        return
+
+    if not await admit_user(update):
         return
 
     session = get_session(chat.id)
@@ -1768,10 +1730,12 @@ def main() -> None:
 
     logger.info(
         "KhmerDubAI | max=%ss | idle=%ss | whisper=%s | "
-        "translator=free-web | tts_parallel=%s | update_parallel=%s",
+        "translator=groq:%s | jobs=%s | tts_parallel=%s | update_parallel=%s",
         MAX_MEDIA_SECONDS,
         SESSION_IDLE_SECONDS,
         WHISPER_MODEL,
+        GROQ_MODEL,
+        JOB_CONCURRENCY,
         TTS_CONCURRENCY,
         UPDATE_CONCURRENCY,
     )
