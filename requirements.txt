@@ -1,9 +1,4 @@
 python-telegram-bot>=22,<23
 edge-tts>=7,<8
 faster-whisper>=1.2,<2
-transformers>=4.52,<6
-torch>=2.4
-sentencepiece>=0.2
-protobuf>=5
-accelerate>=1
-safetensors>=0.5
+deep-translator>=1.11,<2
